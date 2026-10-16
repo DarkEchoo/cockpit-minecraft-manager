@@ -4,6 +4,23 @@ A self-hosted Minecraft server-management interface for [Cockpit](https://cockpi
 
 > **Development snapshot — not a ready-to-install release.** The source here is a sanitized snapshot of the existing manager. Some advanced features call additional local helper programs that are **not included**, and the code assumes Linux services and backup configuration exist. Do not run it on an unprotected production server without reviewing the code and dependencies.
 
+## Screenshots
+
+A tour of the current Cockpit Minecraft Manager interface. Select an image to view it full size. Some server labels and paths shown are examples from the development environment.
+
+<a href="docs/screenshots/OverviewPage.png"><img src="docs/screenshots/OverviewPage.png" alt="Overview page" width="48%"></a>
+<a href="docs/screenshots/FilePage.png"><img src="docs/screenshots/FilePage.png" alt="Files page" width="48%"></a>
+<a href="docs/screenshots/BackupPage.png"><img src="docs/screenshots/BackupPage.png" alt="Backups page" width="48%"></a>
+<a href="docs/screenshots/PlayersPage.png"><img src="docs/screenshots/PlayersPage.png" alt="Players page" width="48%"></a>
+<a href="docs/screenshots/AdvancedControlCenterPage.png"><img src="docs/screenshots/AdvancedControlCenterPage.png" alt="Advanced Control page" width="48%"></a>
+<a href="docs/screenshots/PlayerRecordsAndStoragePage.png"><img src="docs/screenshots/PlayerRecordsAndStoragePage.png" alt="Player Records & Storage page" width="48%"></a>
+<a href="docs/screenshots/PerformancePage.png"><img src="docs/screenshots/PerformancePage.png" alt="Performance page" width="48%"></a>
+<a href="docs/screenshots/RestartsAndResourcesPage.png"><img src="docs/screenshots/RestartsAndResourcesPage.png" alt="Restarts & Resources page" width="48%"></a>
+<a href="docs/screenshots/CreateServerPage.png"><img src="docs/screenshots/CreateServerPage.png" alt="Create Server page" width="48%"></a>
+<a href="docs/screenshots/ModPackPage.png"><img src="docs/screenshots/ModPackPage.png" alt="Modpacks page" width="48%"></a>
+
+See the [complete screenshot gallery](docs/SCREENSHOTS.md).
+
 ## Current functionality in the uploaded snapshot
 
 - Browse and control independent managed Minecraft servers.
