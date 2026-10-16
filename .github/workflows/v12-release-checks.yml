@@ -24,7 +24,7 @@ jobs:
           from pathlib import Path
           for directory in ("backend", "addons/backup-manager/helpers", "tools", "tests"):
               for path in Path(directory).iterdir():
-                  if path.is_file() and not path.name.startswith("."):
+                  if path.is_file() and not path.name.startswith(".") and (path.suffix == ".py" or (path.parent.name in ("backend", "helpers") and path.suffix == "")):
                       ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
           print("Python syntax verified")
           PY
