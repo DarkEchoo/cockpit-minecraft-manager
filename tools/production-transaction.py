@@ -29,8 +29,11 @@ def checksum(path):
     return sha.hexdigest()
 
 def syncdir(path):
-    with os.fdopen(os.open(path, os.O_RDONLY | os.O_DIRECTORY), "rb") as stream:
-        os.fsync(stream.fileno())
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 def guarded_path(prefix, relative):
     if not relative or Path(relative).is_absolute() or ".." in Path(relative).parts:
@@ -121,8 +124,6 @@ def load(prefix):
     records = data.get("files")
     if not isinstance(records, list) or not records:
         raise ValueError("Empty transaction journal")
-    expected = {str(Path(target) / file.name) for source, target in PARTS
-                for file in (PROJECT / source).iterdir() if file.is_file()} if False else None
     seen = set()
     for entry in records:
         name = entry["path"]
