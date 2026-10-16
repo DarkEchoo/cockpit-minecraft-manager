@@ -1,0 +1,55 @@
+name: v1.2 release checks
+on:
+  push:
+    branches: [release/v1.2-unified-installer]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python unit tests
+        run: python3 -m unittest discover -s tests -q
+      - name: Python syntax compilation
+        run: |
+          python3 - <<'PY'
+          import ast
+          from pathlib import Path
+          for directory in ("backend", "addons/backup-manager/helpers", "tools", "tests"):
+              for path in Path(directory).iterdir():
+                  if path.is_file() and not path.name.startswith("."):
+                      ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+          print("Python syntax verified")
+          PY
+      - name: Frontend JavaScript syntax
+        run: |
+          for file in cockpit/minecraft-manager/*.js addons/backup-manager/cockpit/*.js; do
+            node --check "$file"
+          done
+      - name: Read-only packaging audit
+        run: |
+          python3 tools/package-inventory.py > /tmp/package.json
+          python3 - <<'PY'
+          import json
+          report = json.load(open("/tmp/package.json"))
+          assert not report["blockers"], report["blockers"]
+          assert report["packages"]["backup_helpers"]
+          assert report["packages"]["backup_units"]
+          assert not report["safe_to_install"]
+          print("All packaged components present; production install remains gated")
+          PY
+      - name: Ensure production apply is blocked
+        run: |
+          set +e
+          bash install.sh --apply >/tmp/apply-out 2>&1
+          code=$?
+          set -e
+          cat /tmp/apply-out
+          test "$code" -eq 3
