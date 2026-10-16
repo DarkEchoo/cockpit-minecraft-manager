@@ -34,7 +34,13 @@ sys.exit(bool(errors))
 PY
 then ok "Backend Python syntax";else fail "Backend Python parse failure";fi
 if [[ -f "$ROOT/LICENSE" || -f "$ROOT/COPYING" ]]; then ok "License file exists";else fail "No LICENSE/COPYING: do not call this a redistributable open-source release";fi
-if [[ ! -f "$ROOT/install.sh" ]]; then fail "No unified root installer; backup add-on requires pre-existing manager"; else ok "Root installer exists (requires functional test)"; fi
+if [[ ! -f "$ROOT/install.sh" ]]; then
+  fail "No unified root installer"
+elif grep -q 'BLOCKED: v1.2 is a release candidate' "$ROOT/install.sh"; then
+  fail "Unified installer --apply is intentionally blocked pending implementation and tests"
+else
+  ok "Unified installer entry point exists (still requires functional tests)"
+fi
 if command -v rg >/dev/null 2>&1; then
   if rg -n -i 'development snapshot|not a ready-to-install release' "$ROOT/README.md" >/dev/null;then warn "README still labels repository a development snapshot";fi
 fi
