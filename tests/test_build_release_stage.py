@@ -21,6 +21,8 @@ class ReleaseStageTests(unittest.TestCase):
             self.assertIn("templates/systemd/cockpit-mc-snapshot@.service.in", paths)
             self.assertTrue((out / "release-manifest.json").is_file())
             self.assertIn("libexec/cockpit-minecraft-modpack-audit", paths)
+            self.assertIn("libexec/minecraft-default-proxy", paths)
+            self.assertIn("libexec/minecraft-join-announcer", paths)
 
     def test_existing_output_refused(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
