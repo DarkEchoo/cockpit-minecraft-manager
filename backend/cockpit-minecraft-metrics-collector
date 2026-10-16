@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""Read-only Minecraft systemd cgroup sampler. One sample/minute, 7-day bounded SQLite."""
+import os, sqlite3, subprocess, time, pathlib, fcntl
+DB=pathlib.Path('/var/lib/cockpit-minecraft-metrics/history.sqlite3')
+SERVICES=['minecraft-26.service']
+def output(*args):
+    p=subprocess.run(args,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,timeout=8)
+    return p.stdout.strip() if p.returncode==0 else ''
+def main():
+    import json
+    reg=pathlib.Path('/etc/cockpit-minecraft/servers.json')
+    if reg.exists():
+        try:
+            data=json.loads(reg.read_text())
+            for key in data:
+                if __import__('re').fullmatch('[a-z][a-z0-9-]{1,34}',key):SERVICES.append('mc-managed-'+key+'.service')
+        except (ValueError,OSError):pass
+    DB.parent.mkdir(parents=True,exist_ok=True)
+    os.chmod(DB.parent,0o700)
+    lock=DB.parent/'collector.lock'
+    with open(lock,'a+') as f:
+        fcntl.flock(f,fcntl.LOCK_EX)
+        con=sqlite3.connect(DB,timeout=8)
+        try:
+            con.execute('CREATE TABLE IF NOT EXISTS samples (ts INTEGER NOT NULL, unit TEXT NOT NULL, active INTEGER NOT NULL, memory_bytes INTEGER, cpu_usec INTEGER, PRIMARY KEY(ts,unit))')
+            now=int(time.time())
+            for unit in SERVICES[:50]:
+                fields=output('systemctl','show',unit,'--no-pager','-p','ActiveState','-p','ControlGroup')
+                vals=dict(line.split('=',1) for line in fields.splitlines() if '=' in line)
+                active=vals.get('ActiveState')=='active'
+                cg=vals.get('ControlGroup','')
+                mem=cpu=None
+                if active and cg.startswith('/') and '..' not in cg.split('/'):
+                    root=pathlib.Path('/sys/fs/cgroup')/cg.lstrip('/')
+                    try:mem=int((root/'memory.current').read_text().strip())
+                    except (OSError,ValueError):pass
+                    try:
+                        for line in (root/'cpu.stat').read_text().splitlines():
+                            if line.startswith('usage_usec '):cpu=int(line.split()[1]);break
+                    except (OSError,ValueError):pass
+                con.execute('INSERT OR REPLACE INTO samples VALUES(?,?,?,?,?)',(now,unit,int(active),mem,cpu))
+            con.execute('DELETE FROM samples WHERE ts < ?',(now-7*86400,))
+            con.commit()
+        finally:con.close()
+    os.chmod(DB,0o600)
+if __name__=='__main__':main()

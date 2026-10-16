@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""Minecraft v9 resource policy and warning-first scheduled restarts. Root only."""
+import fcntl, json, os, pathlib, re, subprocess, sys, time, datetime, shlex
+BASE=pathlib.Path('/var/lib/cockpit-minecraft/v9')
+REG=pathlib.Path('/etc/cockpit-minecraft/servers.json')
+DROP=pathlib.Path('/etc/systemd/system')
+HELPER='/usr/local/libexec/cockpit-minecraft-helper'
+
+def cmd(args,timeout=12,check=True):
+    p=subprocess.run(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=timeout)
+    if check and p.returncode: raise RuntimeError((p.stderr or p.stdout or 'command failed')[:400])
+    return p.stdout.strip()
+def identity(s):
+    if s=='neoforge':return 'minecraft-26.service'
+    if not re.fullmatch(r'[a-z][a-z0-9-]{1,34}',s):raise ValueError('Bad server identifier')
+    db=json.loads(REG.read_text())
+    if s not in db:raise ValueError('Server not registered')
+    return 'mc-managed-'+s+'.service'
+def running(unit):return cmd(['systemctl','is-active',unit],check=False)=='active'
+def config(s):
+    p=BASE/(s+'.json')
+    return json.loads(p.read_text()) if p.exists() else {'enabled':False,'interval_hours':24,'warn_minutes':5,'due':0,'phase':0}
+def write(s,d):
+    BASE.mkdir(parents=True,exist_ok=True)
+    tmp=BASE/(s+'.json.new')
+    tmp.write_text(json.dumps(d,indent=2)+'\n');os.chmod(tmp,0o600);os.replace(tmp,BASE/(s+'.json'))
+def announcement(s,text):
+    # Same trusted Minecraft helper and local RCON credentials as the existing console.
+    payload=json.dumps([{'text':'[Console]: ','color':'red','bold':True},{'text':text,'color':'gold'}],separators=(',',':'))
+    command='tellraw @a '+payload
+    proc=subprocess.run([HELPER,'command',s,command],capture_output=True,text=True,timeout=15)
+    if proc.returncode:raise RuntimeError('Announcement helper failed')
+    result=json.loads(proc.stdout)
+    if not result.get('ok'):raise RuntimeError(str(result.get('error','RCON unavailable')))
+def status(s):
+    u=identity(s);p=DROP/(u+'.d/90-cockpit-resource-v9.conf')
+    d=config(s)
+    for k in ('enabled','interval_hours','warn_minutes','due','phase'):d.setdefault(k,{'enabled':False,'interval_hours':24,'warn_minutes':5,'due':0,'phase':0}[k])
+    d['server']=s;d['service']=u;d['running']=running(u)
+    d['resource_override']=p.read_text() if p.exists() else 'Not configured'
+    return d
+def save_schedule(s,data):
+    identity(s)
+    if not isinstance(data.get('enabled'),bool):raise ValueError('enabled must be boolean')
+    hours=int(data.get('interval_hours',24));warnings=int(data.get('warn_minutes',5))
+    if hours<1 or hours>168 or warnings not in (1,5,10):raise ValueError('Interval 1–168 hours; warnings 1/5/10 minutes')
+    d=config(s);d.update(enabled=data['enabled'],interval_hours=hours,warn_minutes=warnings,phase=0,due=int(time.time()+hours*3600) if data['enabled'] else 0)
+    write(s,d);return status(s)
+def save_resources(s,data):
+    u=identity(s)
+    if running(u):raise ValueError('Stop the selected server before changing persistent resource limits')
+    quota=int(data.get('cpu_percent',0));limit=int(data.get('memory_max_gib',0));mn=int(data.get('heap_min_gib',0));mx=int(data.get('heap_max_gib',0))
+    if quota<0 or quota>2800 or limit<0 or limit>26:raise ValueError('CPU quota 0–2800%; memory cap 0–26 GiB')
+    if (mn or mx) and not (1<=mn<=mx<=24):raise ValueError('Heap must satisfy 1 <= minimum <= maximum <= 24 GiB')
+    if limit and mx and limit<mx+1:raise ValueError('MemoryMax must exceed JVM Xmx by at least 1 GiB for JVM overhead')
+    if s=='neoforge' and (mn or mx):raise ValueError('NeoForge heap is managed by the existing NeoForge JVM tool. Set CPU/MemoryMax here; edit Xms/Xmx in Control Center v7.')
+    drop=DROP/(u+'.d');drop.mkdir(parents=True,exist_ok=True)
+    target=drop/'90-cockpit-resource-v9.conf'
+    lines=['[Service]', 'CPUQuota='+str(quota)+'%' if quota else 'CPUQuota=infinity', 'MemoryMax='+str(limit)+'G' if limit else 'MemoryMax=infinity']
+    if mn and mx:
+        # Only supports exact managed Vanilla/Spigot ExecStart shape; never rewrite arbitrary startup scripts.
+        raw=cmd(['systemctl','show',u,'-p','ExecStart','--value']);match=re.search(r'argv\[\]=([^;]+)',raw)
+        args=match.group(1).strip() if match else ''
+        parts=shlex.split(args)
+        if (len(parts)<6 or parts[0]!='/usr/bin/java' or not any(x.startswith('-Xmx') for x in parts) or '-jar' not in parts):
+            raise ValueError('Unrecognized Java ExecStart; only safe managed Java command lines can be modified')
+        parts=[('-Xms'+str(mn)+'G' if p.startswith('-Xms') else '-Xmx'+str(mx)+'G' if p.startswith('-Xmx') else p) for p in parts]
+        if not all(p.startswith('-') or ' ' not in p for p in parts):raise ValueError('Unsupported arguments')
+        lines += ['ExecStart=', 'ExecStart='+' '.join(parts)]
+    content='\n'.join(lines)+'\n';tmp=drop/'90-cockpit-resource-v9.conf.new'
+    tmp.write_text(content);os.chmod(tmp,0o644)
+    backup=None
+    if target.exists():
+        backup=drop/('90-cockpit-resource-v9.conf.bak-'+str(int(time.time())))
+        target.replace(backup)
+    tmp.replace(target)
+    try:cmd(['systemctl','daemon-reload'],timeout=25)
+    except Exception:
+        target.unlink(missing_ok=True)
+        if backup:backup.replace(target)
+        subprocess.run(['systemctl','daemon-reload'],timeout=25)
+        raise
+    return status(s)
+def tick():
+    BASE.mkdir(parents=True,exist_ok=True)
+    with (BASE/'.lock').open('w') as lk:
+        fcntl.flock(lk,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        for p in BASE.glob('*.json'):
+            s=p.stem
+            try:
+                u=identity(s);d=config(s);now=int(time.time())
+                if not d.get('enabled') or not running(u):continue
+                interval=int(d.get('interval_hours',24))*3600; warn=int(d.get('warn_minutes',5))*60
+                due=int(d.get('due') or now+interval)
+                # Reset stale schedules instead of immediately restarting after host/server downtime.
+                if due<now-120:d.update(due=now+interval,phase=0);write(s,d);continue
+                phase=d.get('phase',0)
+                if not phase and now>=due-warn:
+                    announcement(s,f'Scheduled server restart in {warn//60} minutes. Please find a safe place.')
+                    d['phase']=1;write(s,d)
+                elif phase==1 and warn>60 and now>=due-60:
+                    announcement(s,'Scheduled server restart in 1 minute. World will save on shutdown.')
+                    d['phase']=2;write(s,d)
+                elif phase>=1 and now>=due:
+                    # Stop if the shutdown warning had failed earlier. Never restart an unannounced server.
+                    cmd(['systemctl','restart',u],timeout=180)
+                    d.update(due=now+interval,phase=0);write(s,d)
+            except Exception as exc:
+                # Fail closed: no automatic restart after RCON or service failures.
+                try:
+                    failed=config(s);failed['enabled']=False;failed['last_error']=str(exc)[:250];write(s,failed)
+                except Exception:pass
+                print(f'{s}: {exc} (schedule disabled)',file=sys.stderr)
+
+def main():
+    if os.geteuid():raise PermissionError('Requires Cockpit admin elevation')
+    op=sys.argv[1];s=sys.argv[2] if len(sys.argv)>2 else None
+    if op=='tick':tick();return {'checked':True}
+    if not s:raise ValueError('Missing server identifier')
+    if op=='status':return status(s)
+    if op in ('schedule','resources'):
+        raw=sys.stdin.buffer.read(4096);data=json.loads(raw.decode())
+        return save_schedule(s,data) if op=='schedule' else save_resources(s,data)
+    raise ValueError('Unknown operation')
+if __name__=='__main__':
+    try:print(json.dumps({'ok':True,'data':main()}))
+    except Exception as e:
+        print(json.dumps({'ok':False,'error':str(e)[:450]}))
+        sys.exit(1)

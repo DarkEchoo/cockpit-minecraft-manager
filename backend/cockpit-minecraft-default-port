@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Small fixed-operation privileged helper used through Cockpit superuser bridge."""
+import json, pathlib, re, subprocess, sys, socket, os
+REG=pathlib.Path('/etc/cockpit-minecraft/servers.json')
+CFG=pathlib.Path('/etc/minecraft-default-port.json')
+UNIT='minecraft-default-port.service'
+def run(*cmd):
+    r=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=20)
+    if r.returncode:raise RuntimeError((r.stderr or r.stdout).strip()[:400])
+    return r.stdout.strip()
+def servers():
+    d=json.loads(REG.read_text()) if REG.exists() else {}
+    items={'neoforge':{'port':25565,'unit':'minecraft-26.service','label':'NeoForge'}}
+    for name,entry in d.items():
+        if not re.fullmatch(r'[a-z][a-z0-9-]{1,34}',name):continue
+        port=entry.get('port')
+        if type(port) is int and 1<=port<=65535:
+            items[name]={'port':port,'unit':'mc-managed-'+name+'.service','label':str(entry.get('type','Minecraft'))+' — '+name}
+    return items
+def active(unit):
+    return subprocess.run(['systemctl','is-active','--quiet',unit],timeout=5).returncode==0
+def owner():
+    # Identifies potential listener ownership; don't infer the owner from service state.
+    r=subprocess.run(['ss','-H','-ltn','sport','=','25565'],capture_output=True,text=True,timeout=5)
+    return r.stdout.strip()[:300]
+def status():
+    d=json.loads(CFG.read_text()) if CFG.exists() else {}
+    return {'mode':d.get('mode','unconfigured'),'selected':d.get('selected'), 'port':d.get('port'),
+        'proxy_active':active(UNIT),'port_25565_listener':owner(), 'servers':servers(),
+        'warning':'TCP forwarding hides original client IP from backend Minecraft; Java Edition only.'}
+def configure(id):
+    options=servers()
+    if id not in options:raise ValueError('Unknown server selection')
+    target=options[id]
+    p=target['port']
+    if not active(target['unit']):raise ValueError('Start the chosen Minecraft server first, then select default port routing')
+    if p!=25565 and owner() and not active(UNIT):
+        raise ValueError('Port 25565 is occupied. Stop the existing 25565 server through Cockpit first. Nothing changed.')
+    old=CFG.read_bytes() if CFG.exists() else None
+    data={'mode':'direct' if p==25565 else 'proxy','selected':id,'port':p}
+    tmp=CFG.with_name('default-port.json.tmp')
+    tmp.write_text(json.dumps(data)+'\n');os.chmod(tmp,0o644)
+    try:
+        if p==25565:
+            if active(UNIT):
+                raise ValueError('Port proxy is running. Stop proxy before starting the direct-25565 server; no change made.')
+            run('systemctl','disable','--now',UNIT)
+            tmp.replace(CFG)
+        else:
+            tmp.replace(CFG)
+            if active(UNIT):run('systemctl','restart',UNIT)
+            else:run('systemctl','enable','--now',UNIT)
+            if not active(UNIT):raise RuntimeError('Port proxy did not start; check journalctl -u minecraft-default-port')
+    except Exception:
+        if old is not None: CFG.write_bytes(old)
+        else: CFG.unlink(missing_ok=True)
+        raise
+    finally: tmp.unlink(missing_ok=True)
+    return status()
+def main():
+    if os.geteuid()!=0:raise PermissionError('Requires Cockpit administrator authorization')
+    cmd=sys.argv[1] if len(sys.argv)>1 else ''
+    if cmd=='status' and len(sys.argv)==2: return status()
+    if cmd=='select' and len(sys.argv)==3:return configure(sys.argv[2])
+    raise ValueError('Invalid operation')
+if __name__=='__main__':
+    try:print(json.dumps({'ok':True,'data':main()}))
+    except Exception as e:print(json.dumps({'ok':False,'error':str(e)[:400]}));sys.exit(1)

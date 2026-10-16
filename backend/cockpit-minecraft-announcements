@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""Per-server periodic Minecraft announcements; runs as root via Cockpit or systemd."""
+import os,sys,json,time,tempfile,pathlib,subprocess,fcntl,re,datetime
+BASE=pathlib.Path('/var/lib/cockpit-minecraft-announcements')
+CONFIG=BASE/'schedules.json'
+HISTORY=BASE/'history.log'
+HELPER='/usr/local/libexec/cockpit-minecraft-helper'
+VALID_COLORS={'white','gold','yellow','green','aqua','blue','light_purple','red','gray'}
+
+def invoke(*args):
+    r=subprocess.run([HELPER,*args],text=True,capture_output=True,timeout=16)
+    if r.returncode:raise RuntimeError('Minecraft helper exited unsuccessfully')
+    v=json.loads(r.stdout)
+    if not v.get('ok'):raise RuntimeError(str(v.get('error','Helper error'))[:300])
+    return v.get('data')
+
+def load():
+    if not CONFIG.exists():return {}
+    return json.loads(CONFIG.read_text())
+
+def store(d):
+    fd,p=tempfile.mkstemp(prefix='.schedule-',dir=BASE)
+    try:
+        os.fchmod(fd,0o600)
+        with os.fdopen(fd,'w') as f:
+            json.dump(d,f,separators=(',',':'));f.flush();os.fsync(f.fileno())
+        os.replace(p,CONFIG)
+    finally:
+        if os.path.exists(p):os.unlink(p)
+
+def record(server,text):
+    # Log status but not message contents, player identifiers or RCON secrets.
+    with HISTORY.open('a') as f:
+        os.chmod(HISTORY,0o600)
+        f.write(time.strftime('%Y-%m-%d %H:%M:%S %z')+' | '+server+' | '+text+'\n')
+    if HISTORY.stat().st_size>262144:
+        lines=HISTORY.read_text().splitlines()[-600:]
+        HISTORY.write_text('\n'.join(lines)+'\n')
+
+def validate(c):
+    if type(c)!=dict:raise ValueError('Invalid schedule')
+    messages=c.get('messages')
+    minutes=c.get('interval_minutes')
+    if type(minutes)!=int or not 5<=minutes<=1440:raise ValueError('Interval must be 5–1440 minutes')
+    if type(c.get('enabled'))!=bool:raise ValueError('Invalid enabled flag')
+    if type(messages)!=list or not 1<=len(messages)<=8:raise ValueError('Provide 1–8 messages')
+    for m in messages:
+        if not isinstance(m,str) or not 1<=len(m)<=140 or m.startswith('/') or any(ord(ch)<32 or ord(ch)==127 for ch in m):
+            raise ValueError('Each message must contain 1–140 printable characters, not starting with /')
+    quiet=c.get('quiet_hours',{'enabled':False,'start':'23:00','end':'08:00'})
+    if not isinstance(quiet,dict) or type(quiet.get('enabled',False))!=bool:raise ValueError('Invalid quiet hours')
+    for key in ('start','end'):
+        if not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d',str(quiet.get(key,''))):raise ValueError('Quiet hours must use HH:MM')
+    if type(c.get('only_with_players',False))!=bool:raise ValueError('Invalid online-player flag')
+    color=c.get('color','white');bold=c.get('bold',False)
+    if color not in VALID_COLORS or type(bold)!=bool:raise ValueError('Invalid announcement color or bold state')
+    return {'enabled':c['enabled'],'interval_minutes':minutes,'messages':messages,'color':color,'bold':bold,
+            'quiet_hours':{'enabled':quiet['enabled'],'start':quiet['start'],'end':quiet['end']},
+            'only_with_players':c.get('only_with_players',False)}
+
+def in_quiet_hours(c):
+    quiet=c.get('quiet_hours',{})
+    if not quiet.get('enabled'):return False
+    current=datetime.datetime.now().strftime('%H:%M')
+    start,end=quiet['start'],quiet['end']
+    if start==end:return True
+    return start<=current<end if start<end else current>=start or current<end
+
+def has_players(server):
+    # Use the game's authenticated list command. Fail closed if response is unknown.
+    reply=invoke('players',server,'list')
+    if not isinstance(reply,str):return None
+    # Vanilla returns "There are N of a max of M players online"; variants may differ.
+    match=re.search(r'(?:There are|There is)\s+(\d+)\s+(?:of a max of|out of|/)\s*\d+\s+players?',reply,re.I)
+    if not match:match=re.search(r'^(\d+)\s*/\s*\d+\s+players?',reply,re.I)
+    return int(match.group(1))>0 if match else None
+
+def deliver(server,c,now,manual=False):
+    idx=int(c.get('next_index',0))%len(c['messages'])
+    if not manual:
+        if in_quiet_hours(c):
+            record(server,'skipped (quiet hours)');return False
+        if c.get('only_with_players'):
+            try:
+                online=has_players(server)
+                if online is not True:
+                    record(server,'skipped (no players or unavailable count)');return False
+            except Exception:
+                record(server,'skipped (player check unavailable)');return False
+    try:
+        # CONSOLE_PREFIX_V6: tellraw for every periodic message, regardless of its text color.
+        components=[
+            {'text':'[Console]: ','color':'red','bold':True},
+            {'text':c['messages'][idx],'color':c.get('color','white'),'bold':bool(c.get('bold',False))}
+        ]
+        cmd='tellraw @a '+json.dumps(components,ensure_ascii=True,separators=(',',':'))
+        reply=invoke('command',server,cmd)
+        if isinstance(reply,str) and re.search(r'(?:unknown|invalid|expected|incorrect|error)',reply,re.I):
+            raise RuntimeError('Server rejected tellraw format: '+reply[:120])
+    except Exception as e:
+        record(server,'skipped/failed: '+str(e).replace('\n',' ')[:180]);return False
+    c['next_index']=(idx+1)%len(c['messages'])
+    c['last_sent']=now
+    record(server,'sent message '+str(idx+1)+'/'+str(len(c['messages']))+(' (manual)' if manual else ''))
+    return True
+
+def main():
+    if os.geteuid()!=0:raise RuntimeError('Root required')
+    BASE.mkdir(mode=0o700,parents=True,exist_ok=True)
+    os.chmod(BASE,0o700)
+    args=sys.argv[1:]
+    if not args:raise ValueError('Missing action')
+    action=args[0]
+    if action not in ('tick','read','save','test','history'):raise ValueError('Invalid action')
+    server=args[1] if len(args)>1 else None
+    if action!='tick':
+        if len(args)!=2:raise ValueError('Expected server id')
+        available={s['id'] for s in invoke('list')}
+        if server not in available:raise ValueError('Unknown server')
+    with (BASE/'lock').open('a+') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        d=load();now=int(time.time())
+        if action=='read':return d.get(server,{'enabled':False,'interval_minutes':60,'messages':[],'next_due':None,'quiet_hours':{'enabled':False,'start':'23:00','end':'08:00'},'only_with_players':False,'color':'white','bold':False})
+        if action=='history':
+            if not HISTORY.exists():return []
+            return [x for x in HISTORY.read_text().splitlines()[-300:] if (' | '+server+' | ') in x][-40:]
+        if action=='save':
+            raw=sys.stdin.read(8193)
+            if len(raw)>8192:raise ValueError('Schedule too large')
+            c=validate(json.loads(raw))
+            old=d.get(server,{})
+            c.update({'next_index':(old.get('next_index',0) % len(c['messages'])),'next_due':now+c['interval_minutes']*60,'last_sent':old.get('last_sent')})
+            d[server]=c;store(d)
+            record(server,'schedule '+('enabled' if c['enabled'] else 'disabled'))
+            return {'enabled':c['enabled'],'next_due':c['next_due']}
+        if action=='test':
+            c=d.get(server)
+            if not c or not c.get('messages'):raise ValueError('Save a schedule before testing')
+            if not deliver(server,c,now,True):raise RuntimeError('Could not send; check server RCON and history')
+            store(d);return 'Test announcement sent'
+        if action=='tick':
+            for sid,c in d.items():
+                if not c.get('enabled') or now<int(c.get('next_due',now+999999)):continue
+                deliver(sid,c,now)
+                c['next_due']=now+int(c['interval_minutes'])*60
+            store(d)
+            return {'checked':len(d)}
+
+if __name__=='__main__':
+    try: print(json.dumps(main()))
+    except Exception as e:print(str(e),file=sys.stderr);sys.exit(1)

@@ -1,0 +1,53 @@
+# secrets / settings
+.env
+.env.*
+!.env.example
+*secret*
+*token*
+*password*
+*.pem
+*.key
+# Minecraft data and binaries
+server.properties
+ops.json
+whitelist.json
+usercache.json
+*.jar
+*.zip
+*.tar
+*.tar.gz
+world/
+world_*/
+logs/
+crash-reports/
+backups/
+mods/
+config/
+# Python / build
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+
+# Local data and credentials
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.bak
+*.backup
+*.old
+.env.local
+.env.production
+world/
+world_nether/
+world_the_end/
+logs/
+crash-reports/
+backups/
+runtime/
+private/
+credentials/
+*.rcon
+*.jsonl
+*.tar.gz

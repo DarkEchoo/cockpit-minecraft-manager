@@ -1,0 +1,380 @@
+#!/usr/bin/env python3
+"""Conservative modpack workspace and CurseForge browser for the existing Cockpit module.
+No third-party server scripts are executed. No existing server worlds are modified.
+"""
+import json, os, pathlib, re, sys, shutil, zipfile, tempfile, urllib.parse, urllib.request, hashlib, time, pwd, subprocess, socket, stat
+
+ROOT=pathlib.Path('/opt/minecraft/modpack-workspaces')
+KEY=pathlib.Path('/etc/cockpit-minecraft/curseforge-api-key')
+REG=pathlib.Path('/etc/cockpit-minecraft/servers.json')
+MC_GAME_ID=432
+MAX_ARCHIVE=1024*1024*1024
+MAX_EXPAND=3*1024*1024*1024
+MAX_FILES=30000
+SNAPROOT=pathlib.Path('/var/backups/cockpit-minecraft-modpacks')
+UNITROOT=pathlib.Path('/etc/systemd/system')
+
+def ident(value):
+    if not re.fullmatch(r'[a-z][a-z0-9-]{1,34}',value): raise ValueError('Invalid workspace ID (2–35 lowercase letters, numbers, hyphens)')
+    return value
+
+def workspace(name):
+    return ROOT/ident(name)
+
+def load(name):
+    folder=workspace(name)
+    if folder.is_symlink() or not folder.is_dir(): raise ValueError('Workspace not found')
+    meta=folder/'modpack.json'
+    if not meta.is_file() or meta.is_symlink(): raise ValueError('Invalid workspace')
+    data=json.loads(meta.read_text())
+    return folder,data
+
+def save(folder,data):
+    tmp=folder/'modpack.json.new'
+    tmp.write_text(json.dumps(data,indent=2)+'\n')
+    tmp.replace(folder/'modpack.json')
+
+def api(path,params=None):
+    if not KEY.is_file() or KEY.is_symlink():raise ValueError('CurseForge API key not configured; manual ZIP import remains available')
+    if KEY.stat().st_mode & 0o077:raise ValueError('CurseForge key permissions must be 0600')
+    key=KEY.read_text().strip()
+    if not key or len(key)>500:raise ValueError('Invalid API key')
+    url='https://api.curseforge.com/v1/'+path
+    if params:url+='?'+urllib.parse.urlencode(params)
+    req=urllib.request.Request(url,headers={'x-api-key':key,'Accept':'application/json','User-Agent':'JesseCockpitModpackManager/1.0'})
+    with urllib.request.urlopen(req,timeout=25) as response:
+        if urllib.parse.urlparse(response.url).hostname!='api.curseforge.com':raise ValueError('Unexpected metadata redirect')
+        body=response.read(2_000_001)
+    if len(body)>2_000_000:raise ValueError('API response too large')
+    return json.loads(body)
+
+def query(text,category='modpacks',version=''):
+    if len(text)>90 or len(version)>30:raise ValueError('Search too long')
+    if category not in ('modpacks','mods'):raise ValueError('Invalid search category')
+    params={'gameId':MC_GAME_ID,'classId':4471 if category=='modpacks' else 6,'searchFilter':text,'pageSize':20}
+    if version:params['gameVersion']=version
+    payload=api('mods/search',params)
+    return [{'id':p['id'],'name':p.get('name',''),'summary':p.get('summary','')[:350],
+             'downloads':p.get('downloadCount',0),'slug':p.get('slug',''),
+             'latest_files':[{'id':f.get('id'),'name':f.get('fileName'), 'server_pack_id':f.get('serverPackFileId')} for f in p.get('latestFiles',[])[:12]]}
+            for p in payload.get('data',[]) if isinstance(p,dict)]
+
+def cf_files(project_id):
+    pid=int(project_id)
+    if pid<=0:raise ValueError('Invalid project ID')
+    data=api('mods/'+str(pid)+'/files',{'pageSize':50}).get('data',[])
+    return [{'id':f.get('id'),'name':f.get('fileName'),'server_pack_id':f.get('serverPackFileId'),
+             'is_server_pack':f.get('isServerPack',False),'game_versions':f.get('gameVersions',[])[:12],
+             'release_type':f.get('releaseType'),'file_length':f.get('fileLength',0)} for f in data[:50]]
+
+def check_archive(path):
+    with zipfile.ZipFile(path) as z:
+        infos=z.infolist()
+        if len(infos)>MAX_FILES:raise ValueError('Too many files in archive')
+        total=0
+        for entry in infos:
+            n=entry.filename
+            p=pathlib.PurePosixPath(n)
+            if not n or '\\' in n or '\x00' in n or p.is_absolute() or '..' in p.parts or ':' in n or n.startswith('//'):
+                raise ValueError('Unsafe archive path: '+n[:100])
+            if (entry.external_attr >> 16) & 0o170000 == 0o120000:raise ValueError('Archive contains symbolic link')
+            total+=entry.file_size
+            if total>MAX_EXPAND:raise ValueError('Archive extraction exceeds 3 GiB limit')
+        return len(infos),total
+
+def import_zip(name,filename,data):
+    ident(name)
+    if len(data)>MAX_ARCHIVE:raise ValueError('Archive exceeds 1 GiB limit')
+    if not filename.lower().endswith('.zip'):raise ValueError('Only ZIP archives are supported')
+    if REG.exists() and name in json.loads(REG.read_text()):raise ValueError('ID already belongs to a managed server')
+    ROOT.mkdir(parents=True,exist_ok=True)
+    target=ROOT/name
+    if target.exists() or target.is_symlink():raise ValueError('Workspace already exists')
+    with tempfile.TemporaryDirectory(prefix='modpack-upload-',dir=str(ROOT)) as td:
+        temp=pathlib.Path(td)
+        archive=temp/'source.zip'; archive.write_bytes(data)
+        count,expanded=check_archive(archive)
+        source_hash=hashlib.sha256(data).hexdigest()
+        extracted=temp/'files';extracted.mkdir()
+        with zipfile.ZipFile(archive) as z:
+            for entry in z.infolist():
+                if entry.is_dir():continue
+                out=extracted.joinpath(*pathlib.PurePosixPath(entry.filename).parts)
+                out.parent.mkdir(parents=True,exist_ok=True)
+                with z.open(entry) as src,out.open('xb') as dst:shutil.copyfileobj(src,dst,1024*1024)
+        # Archive may be client pack (manifest.json + overrides), not runnable server pack.
+        manifest=next(iter(extracted.glob('manifest.json')),None)
+        curse_client=False
+        loader='unknown';version='unknown';missing=[]
+        if manifest:
+            try:
+                raw=json.loads(manifest.read_text())
+                curse_client=isinstance(raw.get('files'),list) and isinstance(raw.get('minecraft'),dict)
+                version=raw.get('minecraft',{}).get('version','unknown')
+                loaders=raw.get('minecraft',{}).get('modLoaders',[])
+                if loaders:loader=loaders[0].get('id','unknown')
+                if curse_client:missing=['Client manifests reference CurseForge files that are NOT bundled. Import an official server pack instead.']
+            except (ValueError,UnicodeError,AttributeError,TypeError):pass
+        runnable=(extracted/'server.jar').is_file() and zipfile.is_zipfile(extracted/'server.jar') and not curse_client
+        status='staged-server-files' if runnable else 'staged-needs-server-loader'
+        meta={'id':name,'source_filename':pathlib.Path(filename).name[:120], 'source_sha256':source_hash,
+              'created_at':int(time.time()),'status':status,'minecraft_version':version,'loader':loader,
+              'files':count,'uncompressed_bytes':expanded,'warnings':missing or ([] if runnable else ['Archive staged only: executable server launcher is not verified.']),
+              'mods':[],'project_id':None,'file_id':None}
+        # No scripts are executed and no existing server registrations are touched.
+        extracted.rename(temp/'content')
+        (temp/'content').rename(target)
+        try: save(target,meta)
+        except Exception:
+            shutil.rmtree(target)
+            raise
+    return {'workspace':name,'status':status,'files':count,'warnings':meta['warnings']}
+
+def new_manifest(name,version,loader):
+    ident(name)
+    if not re.fullmatch(r'[0-9][a-zA-Z0-9._-]{0,29}',version):raise ValueError('Invalid Minecraft version')
+    if loader not in ('forge','neoforge','fabric','quilt'):raise ValueError('Invalid loader')
+    if REG.exists() and name in json.loads(REG.read_text()):raise ValueError('ID already belongs to a managed server')
+    ROOT.mkdir(parents=True,exist_ok=True)
+    folder=workspace(name)
+    if folder.exists() or folder.is_symlink():raise ValueError('Workspace already exists')
+    folder.mkdir(mode=0o750)
+    meta={'id':name,'minecraft_version':version,'loader':loader,'status':'custom-manifest-only',
+          'created_at':int(time.time()),'mods':[],'warnings':['Mod loader and jars must be installed separately; this is a planning workspace, not a runnable server.']}
+    save(folder,meta)
+    return meta
+
+def add_mod(name,project_id,file_id):
+    folder,meta=load(name)
+    pid=int(project_id);fid=int(file_id)
+    if pid<=0 or fid<=0:raise ValueError('Invalid CurseForge identifiers')
+    response=api('mods/'+str(pid)+'/files/'+str(fid)).get('data',{})
+    if int(response.get('id',0))!=fid:raise ValueError('Unexpected file ID')
+    versions=response.get('gameVersions',[])
+    if meta.get('minecraft_version') not in versions:raise ValueError('This file does not advertise the workspace Minecraft version')
+    deps=[{'mod_id':d.get('modId'),'relation_type':d.get('relationType')} for d in response.get('dependencies',[])]
+    entry={'project_id':pid,'file_id':fid,'filename':response.get('fileName',''),'versions':versions,'dependencies':deps}
+    meta['mods']=[m for m in meta.get('mods',[]) if m.get('project_id')!=pid]+[entry]
+    save(folder,meta)
+    return {'added':entry,'note':'Manifest only; mod file not downloaded or installed. Verify loader/client-server compatibility.'}
+
+def details(name):
+    folder,meta=load(name)
+    files=list(folder.rglob('*.jar'))[:2500]
+    meta['jar_inventory']=[str(p.relative_to(folder)) for p in files if p.is_file() and not p.is_symlink()]
+    declared={m.get('project_id') for m in meta.get('mods',[])}
+    missing=[]
+    for mod in meta.get('mods',[]):
+        for dep in mod.get('dependencies',[]):
+            if dep.get('relation_type')==3 and dep.get('mod_id') not in declared:missing.append(dep.get('mod_id'))
+    meta['missing_declared_required_dependency_ids']=sorted(set(missing))
+    meta['ram_guidance']='Try 6–8 GiB for medium packs, 10–12 GiB for large packs; adjust after monitoring, reserve memory for OS.'
+    return meta
+
+def listing():
+    if not ROOT.exists():return []
+    output=[]
+    for p in sorted(ROOT.iterdir()):
+        if p.is_dir() and not p.is_symlink():
+            try:output.append({'name':p.name,**{k:v for k,v in load(p.name)[1].items() if k in ('status','minecraft_version','loader')}})
+            except Exception:pass
+    return output
+
+
+def registry():
+    if not REG.exists():return {}
+    data=json.loads(REG.read_text())
+    if not isinstance(data,dict):raise ValueError('Invalid Minecraft registry')
+    return data
+
+def service(id):
+    return 'mc-managed-'+ident(id)+'.service'
+
+def systemctl(*args):
+    p=subprocess.run(['systemctl',*args],capture_output=True,text=True,timeout=25)
+    if p.returncode:raise ValueError((p.stderr or p.stdout or 'systemctl failed')[:700])
+    return p.stdout
+
+def stopped(id):
+    p=subprocess.run(['systemctl','is-active','--quiet',service(id)],capture_output=True,timeout=10)
+    if p.returncode==0:raise ValueError('Stop the selected server before changing mod files or restoring a snapshot')
+    # A failed or activating unit must not be treated as safely stopped.
+    state=subprocess.run(['systemctl','show','-p','ActiveState','--value',service(id)],capture_output=True,text=True,timeout=10).stdout.strip()
+    if state not in ('inactive','failed'):raise ValueError('Service state is not safely stopped: '+state)
+
+def lock_store(data):
+    REG.parent.mkdir(parents=True,exist_ok=True)
+    tmp=REG.with_name(REG.name+'.modpacks.new')
+    with tmp.open('x') as f:
+        json.dump(data,f,indent=2);f.write('\n');f.flush();os.fsync(f.fileno())
+    os.chmod(tmp,0o600)
+    os.replace(tmp,REG)
+
+def safety_path(folder):
+    if folder.is_symlink() or not folder.is_dir():raise ValueError('Invalid or missing workspace')
+    for root,dirs,files in os.walk(folder,followlinks=False):
+        for fname in dirs+files:
+            f=pathlib.Path(root)/fname
+            if f.is_symlink():raise ValueError('Workspace contains symlink; operation refused')
+
+def deploy(name,port_text,ram_text):
+    folder,meta=load(name)
+    if meta.get('status')!='staged-server-files':raise ValueError('Only staged validated server.jar packs can be deployed. Client packs and custom manifests are not runnable.')
+    safety_path(folder)
+    jar=folder/'server.jar'
+    if not jar.is_file() or not zipfile.is_zipfile(jar):raise ValueError('No valid server.jar; loader installation is required first')
+    if shutil.which('java') is None:raise ValueError('Java is missing')
+    if not pwd.getpwnam('minecraft'):raise ValueError('minecraft service user missing')
+    ram=int(ram_text)
+    if not 2<=ram<=24:raise ValueError('RAM maximum must be between 2 and 24 GiB')
+    db=registry()
+    if name in db:raise ValueError('Server already registered')
+    unit=UNITROOT/service(name)
+    if unit.exists():raise ValueError('Service already exists')
+    ports={25565,25575,*[int(v['port']) for v in db.values()]}
+    port=int(port_text)
+    if port==0:port=next((p for p in range(25566,25650) if p not in ports),0)
+    if port in ports or not 1024<=port<=65535:raise ValueError('Port is unavailable')
+    with socket.socket() as sk:
+        try:sk.bind(('0.0.0.0',port))
+        except OSError:raise ValueError('Port already bound')
+    # Existing files never executed during deployment. Start is an independent action.
+    sp=folder/'server.properties'
+    if sp.exists():
+        txt=sp.read_text()
+        txt=re.sub(r'(?m)^server-port\s*=.*$', '', txt)
+        sp.write_text(txt.rstrip()+f'\nserver-port={port}\n')
+    else:sp.write_text(f'server-port={port}\nenable-rcon=false\n')
+    (folder/'eula.txt').write_text('eula=true\n')
+    uid=pwd.getpwnam('minecraft').pw_uid;gid=pwd.getpwnam('minecraft').pw_gid
+    for root,dirs,files in os.walk(folder):
+        os.chown(root,uid,gid)
+        for x in files:os.chown(os.path.join(root,x),uid,gid)
+    contents=f"""[Unit]\nDescription=Cockpit modpack server {name}\nAfter=network-online.target\nWants=network-online.target\nRequiresMountsFor={folder}\n\n[Service]\nType=simple\nUser=minecraft\nGroup=minecraft\nWorkingDirectory={folder}\nExecStart=/usr/bin/java -Xms1G -Xmx{ram}G -jar {jar} nogui\nRestart=on-failure\nRestartSec=10\nNoNewPrivileges=true\nProtectSystem=strict\nReadWritePaths={folder}\nPrivateTmp=true\n\n[Install]\nWantedBy=multi-user.target\n"""
+    # Keep service disabled/stopped; do not enable or start automatically.
+    unit.write_text(contents);unit.chmod(0o644)
+    try:
+        systemctl('daemon-reload')
+        db=registry()
+        if name in db:raise ValueError('Concurrent registration detected')
+        db[name]={'type':'modpack','version':str(meta.get('minecraft_version','unknown'))[:30],'port':port,'path':str(folder)}
+        lock_store(db)
+        meta['status']='deployed-stopped';meta['port']=port;meta['heap_gib']=ram
+        meta['warnings']=meta.get('warnings',[])+['Deployment assumes server.jar is a standalone runnable entrypoint. Some Forge/NeoForge packs require an installer or launch arguments and cannot use this path.']
+        save(folder,meta)
+    except Exception:
+        # Preserve the files for investigation, remove unregistered unit only.
+        if name not in registry():unit.unlink(missing_ok=True)
+        subprocess.run(['systemctl','daemon-reload'],capture_output=True,timeout=20)
+        raise
+    return {'server':name,'port':port,'ram_gib':ram,'state':'stopped and disabled','note':'No world or service started. Verify loader requirements and inspect the unit before manually starting.'}
+
+def snapshots(name):
+    ident(name)
+    path=SNAPROOT/name
+    if not path.exists():return []
+    return sorted((x.name for x in path.iterdir() if x.is_dir() and re.fullmatch(r'[0-9]{8}T[0-9]{6}Z',x.name)),reverse=True)
+
+def snapshot(name):
+    folder,meta=load(name)
+    if meta.get('status')!='deployed-stopped' or name not in registry():raise ValueError('Deploy the modpack first')
+    stopped(name);safety_path(folder)
+    destroot=SNAPROOT/name;destroot.mkdir(parents=True,exist_ok=True)
+    stamp=time.strftime('%Y%m%dT%H%M%SZ',time.gmtime())
+    dest=destroot/stamp
+    if dest.exists():raise ValueError('Snapshot already exists; retry in one second')
+    # Snapshot entire instance including world. Copy must complete before it is marked usable.
+    temp=destroot/('.partial-'+stamp)
+    if temp.exists():raise ValueError('Snapshot in progress')
+    try:
+        shutil.copytree(folder,temp,symlinks=False,copy_function=shutil.copy2)
+        safety_path(temp)
+        temp.rename(dest)
+    except Exception:
+        if temp.exists():shutil.rmtree(temp)
+        raise
+    return {'snapshot':stamp,'path':str(dest),'note':'Full directory copy; confirm filesystem capacity and include off-host backups for disaster recovery.'}
+
+def restore(name,snap):
+    folder,meta=load(name)
+    if meta.get('status')!='deployed-stopped' or name not in registry():raise ValueError('Not a deployed managed modpack')
+    if not re.fullmatch(r'[0-9]{8}T[0-9]{6}Z',snap):raise ValueError('Invalid snapshot name')
+    stopped(name);safety_path(folder)
+    original=SNAPROOT/name/snap
+    if not original.is_dir():raise ValueError('Snapshot not found')
+    safety_path(original)
+    # Always create another recovery point before replacing current state.
+    point=snapshot(name)['snapshot']
+    stage=folder.with_name(folder.name+'.restore-staging')
+    if stage.exists():raise ValueError('Restore staging directory exists; inspect before continuing')
+    shutil.copytree(original,stage)
+    old=folder.with_name(folder.name+'.pre-restore-'+time.strftime('%Y%m%dT%H%M%SZ',time.gmtime()))
+    if old.exists():raise ValueError('Pre-restore directory exists; retry')
+    try:
+        folder.rename(old)
+        stage.rename(folder)
+    except Exception:
+        if old.exists() and not folder.exists():old.rename(folder)
+        raise
+    return {'restored':snap,'pre_restore_snapshot':point,'previous_files_retained_at':str(old),'state':'stopped'}
+
+def toggle_mod(name,filename,enable):
+    folder,meta=load(name)
+    if meta.get('status')!='deployed-stopped' or name not in registry():raise ValueError('Deploy a managed modpack first')
+    stopped(name)
+    if not re.fullmatch(r'[a-zA-Z0-9_.+()-]{1,200}\.jar(\.disabled)?',filename):raise ValueError('Invalid mod filename')
+    path=folder/'mods'/filename
+    if path.is_symlink() or not path.is_file():raise ValueError('Mod not found')
+    if not path.resolve().is_relative_to((folder/'mods').resolve()):raise ValueError('Unsafe mod path')
+    if enable:
+        if not filename.endswith('.jar.disabled'):raise ValueError('Select a disabled JAR')
+        dest=path.with_suffix('')
+    else:
+        if not filename.endswith('.jar'):raise ValueError('Select an enabled JAR')
+        dest=path.with_name(path.name+'.disabled')
+    if dest.exists():raise ValueError('Destination already exists')
+    snap=snapshot(name)['snapshot']
+    path.rename(dest)
+    return {'mod':filename,'enabled':enable,'new_filename':dest.name,'snapshot':snap,'restart_required':True}
+
+def log_tail(name):
+    folder,meta=load(name)
+    if name not in registry() or meta.get('status')!='deployed-stopped':raise ValueError('Not deployed')
+    p=subprocess.run(['journalctl','-u',service(name),'-n','100','--no-pager','--output=short-iso'],capture_output=True,text=True,timeout=15)
+    return {'logs':p.stdout[-20000:] if p.returncode==0 else p.stderr[:500]}
+
+def inventory(name):
+    folder,meta=load(name)
+    md=folder/'mods'
+    return {'mods':sorted(p.name for p in md.iterdir() if p.is_file() and not p.is_symlink() and (p.name.endswith('.jar') or p.name.endswith('.jar.disabled'))) if md.is_dir() and not md.is_symlink() else []}
+
+def main(args):
+    if not args:raise ValueError('Operation required')
+    op,*a=args
+    if op=='status' and not a:return {'key_configured':KEY.is_file() and KEY.stat().st_mode & 0o077==0,'workspaces':listing()}
+    if op=='search' and len(a)==3:return query(*a)
+    if op=='files' and len(a)==1:return cf_files(a[0])
+    if op=='create-manifest' and len(a)==3:return new_manifest(*a)
+    if op=='import' and len(a)==2:
+        raw=sys.stdin.buffer.read(MAX_ARCHIVE+1)
+        return import_zip(a[0],a[1],raw)
+    if op=='detail' and len(a)==1:return details(a[0])
+    if op=='add-mod' and len(a)==3:return add_mod(*a)
+    if op=='export' and len(a)==1:return load(a[0])[1]
+    if op=='deploy' and len(a)==3:return deploy(*a)
+    if op=='snapshot' and len(a)==1:return snapshot(a[0])
+    if op=='snapshots' and len(a)==1:return snapshots(a[0])
+    if op=='restore' and len(a)==2:return restore(*a)
+    if op=='inventory' and len(a)==1:return inventory(a[0])
+    if op=='mod-disable' and len(a)==2:return toggle_mod(a[0],a[1],False)
+    if op=='mod-enable' and len(a)==2:return toggle_mod(a[0],a[1],True)
+    if op=='logs' and len(a)==1:return log_tail(a[0])
+    raise ValueError('Invalid operation')
+
+if __name__=='__main__':
+    try:
+        if os.geteuid()!=0:raise PermissionError('Administrative access required')
+        result=main(sys.argv[1:])
+        print(json.dumps({'ok':True,'data':result}))
+    except Exception as exc:
+        print(json.dumps({'ok':False,'error':str(exc)[:900]}))

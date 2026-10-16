@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Scoped Minecraft Branding Studio API. Separate from game and backup operations."""
+import base64, datetime as dt, io, json, os, re, shutil, socket, sqlite3, struct, sys, tempfile, subprocess
+from pathlib import Path
+from PIL import Image, ImageOps
+
+REG=Path('/etc/cockpit-minecraft/servers.json')
+STATE=Path('/var/lib/cockpit-minecraft/branding-v8')
+LABELS=Path('/var/lib/cockpit-minecraft/branding.json')
+COLORS={'black':'0','dark_blue':'1','dark_green':'2','dark_aqua':'3','dark_red':'4','dark_purple':'5','gold':'6','gray':'7','dark_gray':'8','blue':'9','green':'a','aqua':'b','red':'c','light_purple':'d','yellow':'e','white':'f'}
+
+def response(data=None,**extra): print(json.dumps({'ok':True,'data':data,**extra}))
+def checkid(name):
+    if not re.fullmatch(r'[a-zA-Z0-9_-]{1,80}',name):raise ValueError('Invalid server ID')
+    d=json.loads(REG.read_text());info=d.get(name)
+    if not isinstance(info,dict):raise ValueError('Unregistered server')
+    base=Path(info['path']).resolve(strict=True)
+    if not base.is_dir() or not str(base).startswith('/opt/minecraft/'):raise ValueError('Unsafe server location')
+    return base,info
+
+def require_stopped(id):
+    unit=("minecraft-26.service" if id=="neoforge" else "mc-managed-"+id+".service")
+    proc=subprocess.run(["systemctl","is-active",unit],capture_output=True,text=True,timeout=3)
+    if proc.stdout.strip() in ("active","activating","reloading"):raise ValueError("Stop "+unit+" before icon changes")
+
+def init():
+    STATE.mkdir(parents=True,exist_ok=True);os.chmod(STATE,0o700)
+    db=sqlite3.connect(STATE/'history.sqlite3',timeout=4)
+    db.execute('CREATE TABLE IF NOT EXISTS changes (n INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, server TEXT, kind TEXT, description TEXT, before TEXT, after TEXT, icon_before BLOB, icon_after BLOB)')
+    db.commit();return db
+
+def props_get(path):
+    if not path.exists():raise ValueError('server.properties not found')
+    for line in path.read_text().splitlines():
+        if line.startswith('motd='):return line[5:]
+    return ''
+
+def atomic(path, content):
+    fd,tmp=tempfile.mkstemp(prefix='.branding-v8-',dir=path.parent)
+    try:
+        os.fchmod(fd,(path.stat().st_mode & 0o777) if path.exists() else 0o644)
+        if path.exists():os.fchown(fd,path.stat().st_uid,path.stat().st_gid)
+        with os.fdopen(fd,'wb') as f:f.write(content);f.flush();os.fsync(f.fileno())
+        os.replace(tmp,path)
+    finally:
+        if os.path.exists(tmp):os.unlink(tmp)
+
+def label_read(id):
+    try:return json.loads(LABELS.read_text()).get(id,'')
+    except (OSError,ValueError):return ''
+
+def record(db,id,kind,description,before='',after='',ib=None,ia=None):
+    db.execute('INSERT INTO changes(date,server,kind,description,before,after,icon_before,icon_after) VALUES(?,?,?,?,?,?,?,?)',(dt.datetime.now(dt.timezone.utc).isoformat(),id,kind,description,before,after,ib,ia));db.commit()
+
+def read_payload(limit=5_000_000):
+    raw=sys.stdin.buffer.read(limit+1)
+    if len(raw)>limit:raise ValueError('Payload exceeds size limit')
+    return json.loads(raw or b'{}')
+
+def image_data(obj):
+    encoded=obj.get('image','')
+    if not isinstance(encoded,str) or len(encoded)>4_000_000:raise ValueError('Icon payload too large')
+    raw=base64.b64decode(encoded,validate=True)
+    if len(raw)>2_500_000:raise ValueError('Icon input too large')
+    with Image.open(io.BytesIO(raw)) as im:
+        if im.width>4096 or im.height>4096 or im.width<1 or im.height<1:raise ValueError('Invalid image dimensions')
+        im.load()
+        mode=obj.get('mode','crop')
+        if mode not in ('crop','fit'):raise ValueError('Invalid image mode')
+        im=ImageOps.exif_transpose(im).convert('RGBA')
+        if mode=='crop':im=ImageOps.fit(im,(64,64),method=Image.Resampling.LANCZOS)
+        else:im=ImageOps.pad(im,(64,64),method=Image.Resampling.LANCZOS,color=(0,0,0,0))
+        stream=io.BytesIO();im.save(stream,format='PNG');return stream.getvalue()
+
+def status_ping(port):
+    # Bounded Java Edition status ping; no RCON use.
+    def varint(n):
+        b=bytearray()
+        while True:
+            byte=n&127;n>>=7;b.append(byte|(128 if n else 0))
+            if not n:return bytes(b)
+    def recvvar(s):
+        n=0
+        for shift in range(0,35,7):
+            z=s.recv(1)
+            if not z:raise ValueError('Unexpected EOF')
+            n|=(z[0]&127)<<shift
+            if not z[0]&128:return n
+        raise ValueError('Malformed packet')
+    with socket.create_connection(('127.0.0.1',int(port)),timeout=2.0) as s:
+        s.settimeout(2)
+        host=b'localhost';body=b'\0'+varint(765)+varint(len(host))+host+struct.pack('>H',int(port))+b'\x01'
+        s.sendall(varint(len(body))+body+b'\x01\x00')
+        if recvvar(s)>1_000_000:raise ValueError('Response too large')
+        if recvvar(s)!=0:raise ValueError('Unexpected status response')
+        n=recvvar(s)
+        if n>900000:raise ValueError('Response too large')
+        data=bytearray()
+        while len(data)<n:
+            part=s.recv(n-len(data))
+            if not part:break
+            data.extend(part)
+        if len(data)!=n:raise ValueError('Partial status response')
+        j=json.loads(data)
+        return {'online':True,'version':j.get('version',{}),'players':j.get('players',{}),'description':j.get('description'),'favicon':j.get('favicon','')[:150000]}
+
+def main():
+    if len(sys.argv)!=3:raise ValueError('Usage: <operation> <server-id>')
+    op,id=sys.argv[1:];base,info=checkid(id);db=init();prop=base/'server.properties';icon=base/'server-icon.png'
+    if op=='inspect':
+        last=db.execute('SELECT date,kind,description FROM changes WHERE server=? ORDER BY n DESC LIMIT 5',(id,)).fetchall()
+        response({'id':id,'path':str(base),'port':info.get('port'),'label':label_read(id),'motd':props_get(prop),'icon':icon.exists(),'icon_bytes':icon.stat().st_size if icon.exists() else 0,'icon_b64':base64.b64encode(icon.read_bytes()).decode() if icon.exists() and icon.stat().st_size<1000000 else '', 'recent':last,'restart_required':'MOTD and icon changes take effect after Minecraft restart'})
+    elif op=='ping':
+        try:response(status_ping(info['port']))
+        except Exception as exc:response({'online':False,'reason':str(exc)[:160]})
+    elif op=='history':
+        rows=db.execute('SELECT n,date,kind,description,before,after FROM changes WHERE server=? ORDER BY n DESC LIMIT 60',(id,)).fetchall()
+        response([dict(zip(('id','date','kind','description','before','after'),r)) for r in rows])
+    elif op=='presets-list':
+        target=STATE/'presets.json';d=json.loads(target.read_text()) if target.exists() else {};response(d.get(id,{}))
+    elif op=='presets-save':
+        obj=read_payload();name=obj.get('name','')
+        if not isinstance(name,str) or not re.fullmatch(r'[\w -]{1,40}',name):raise ValueError('Invalid preset name')
+        target=STATE/'presets.json';d=json.loads(target.read_text()) if target.exists() else {};items=d.setdefault(id,{})
+        if len(items)>=30 and name not in items:raise ValueError('Preset limit reached')
+        items[name]={'motd':props_get(prop),'label':label_read(id),'icon':base64.b64encode(icon.read_bytes()).decode() if icon.exists() and icon.stat().st_size<250000 else ''}
+        atomic(target,json.dumps(d).encode());response({'name':name})
+    elif op=='preset-copy':
+        obj=read_payload();source=obj.get('source','');name=obj.get('name','')
+        checkid(source)
+        f=STATE/'presets.json';d=json.loads(f.read_text()) if f.exists() else {}
+        item=d.get(source,{}).get(name)
+        if not item:raise ValueError('Source preset unavailable')
+        dest=d.setdefault(id,{})
+        if len(dest)>=30 and name not in dest:raise ValueError('Destination preset limit reached')
+        dest[name]=item;atomic(f,json.dumps(d).encode());response({'copied':name,'from':source,'to':id,'applied':False})
+    elif op=='motd-save':
+        obj=read_payload();motd=obj.get('motd','')
+        if not isinstance(motd,str) or len(motd)>240 or '\n' in motd or '\r' in motd or '\0' in motd:raise ValueError('Invalid MOTD')
+        old=props_get(prop);source=prop.read_text();lines=source.splitlines(keepends=True)
+        changed=False
+        for i,l in enumerate(lines):
+            if l.startswith('motd='):lines[i]='motd='+motd+'\n';changed=True;break
+        if not changed:lines.append('motd='+motd+'\n')
+        atomic(prop,''.join(lines).encode());record(db,id,'motd','Changed server MOTD',old,motd)
+        response({'path':str(prop),'restart_required':True})
+    elif op=='icon-save':
+        require_stopped(id)
+        obj=read_payload();new=image_data(obj);old=icon.read_bytes() if icon.exists() else None
+        if old is not None and len(old)>250000:raise ValueError('Previous icon too large to save safely in history')
+        atomic(icon,new);record(db,id,'icon','Changed server icon',ib=old,ia=new)
+        response({'path':str(icon),'bytes':len(new),'restart_required':True})
+    elif op=='restore':
+        obj=read_payload();rid=int(obj.get('history_id',0));row=db.execute('SELECT kind,before,icon_before FROM changes WHERE server=? AND n=?',(id,rid)).fetchone()
+        if not row:raise ValueError('History entry unavailable')
+        kind,before,oldicon=row
+        if kind=='motd':
+            source=prop.read_text();lines=source.splitlines(keepends=True)
+            for i,l in enumerate(lines):
+                if l.startswith('motd='):lines[i]='motd='+before+'\n';break
+            now=props_get(prop);atomic(prop,''.join(lines).encode());record(db,id,'motd','Restored MOTD entry '+str(rid),now,before)
+        elif kind=='icon':
+            require_stopped(id)
+            if oldicon is None:
+                now=icon.read_bytes() if icon.exists() else None
+                if icon.exists():icon.unlink()
+                record(db,id,'icon','Removed icon via restore '+str(rid),ib=now)
+            else:
+                now=icon.read_bytes() if icon.exists() else None
+                atomic(icon,oldicon);record(db,id,'icon','Restored icon entry '+str(rid),ib=now,ia=oldicon)
+        else:raise ValueError('This change type cannot be restored')
+        response({'restored':kind,'restart_required':True})
+    elif op=='preset-apply':
+        obj=read_payload();name=obj.get('name','');d=json.loads((STATE/'presets.json').read_text());item=d.get(id,{}).get(name)
+        if not item:raise ValueError('Preset not found')
+        if item.get('icon'):require_stopped(id)
+        newmotd=item['motd'];oldmotd=props_get(prop);lines=prop.read_text().splitlines(keepends=True)
+        for i,line in enumerate(lines):
+            if line.startswith('motd='):lines[i]='motd='+newmotd+'\n';break
+        atomic(prop,''.join(lines).encode());record(db,id,'motd','Applied preset '+name,oldmotd,newmotd)
+        if item.get('icon'):
+            require_stopped(id)
+            newicon=base64.b64decode(item['icon']);oldicon=icon.read_bytes() if icon.exists() else None
+            atomic(icon,newicon);record(db,id,'icon','Applied preset icon '+name,ib=oldicon,ia=newicon)
+        response({'preset':name,'applied':['motd','icon' if item.get('icon') else ''], 'label_not_changed':True,'restart_required':True})
+    else:raise ValueError('Unsupported operation')
+
+if __name__=='__main__':
+    try:main()
+    except Exception as exc:
+        print(json.dumps({'ok':False,'error':str(exc)[:280]}));sys.exit(1)

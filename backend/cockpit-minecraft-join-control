@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""Dedicated, constrained Cockpit bridge for the existing Vanilla join announcer."""
+import json, pathlib, re, subprocess, sys, os, tempfile, importlib.util
+CFG=pathlib.Path('/etc/minecraft-join-announcer.json')
+EXEC=pathlib.Path('/usr/local/libexec/minecraft-join-announcer')
+UNIT='minecraft-join-announcer.service'
+COLORS={'white','gold','yellow','green','aqua','blue','light_purple','red','gray','dark_red','dark_green','dark_aqua'}
+DEFAULT_UNIT=os.environ.get('COCKPIT_MC_JOIN_UNIT', '')
+PROPS=os.environ.get('COCKPIT_MC_JOIN_PROPERTIES', '')
+
+def run(*cmd):
+    p=subprocess.run(cmd, text=True, capture_output=True, timeout=12)
+    if p.returncode: raise RuntimeError((p.stderr or p.stdout or 'Command failed').strip()[:350])
+    return p.stdout.strip()
+
+def load():
+    if not DEFAULT_UNIT or not PROPS:raise ValueError('Join-control target is not configured')
+    cfg=json.loads(CFG.read_text())
+    if cfg.get('unit')!=DEFAULT_UNIT or cfg.get('properties')!=PROPS: raise ValueError('Unexpected announcer server configuration; refusing changes')
+    return cfg
+
+def validate(cfg):
+    for k in ('join_message','leave_message'):
+        s=cfg.get(k)
+        if not isinstance(s,str) or len(s)>140 or len(s)<1 or '{player}' not in s or re.search(r'[\x00-\x1f\x7f]',s):
+            raise ValueError(k+' must be 1–140 characters, contain {player}, and have no control characters')
+    if cfg.get('color') not in COLORS: raise ValueError('Unsupported color')
+
+def write(cfg):
+    validate(cfg)
+    fd,path=tempfile.mkstemp(prefix='.mc-join-',dir=str(CFG.parent))
+    try:
+        with os.fdopen(fd,'w') as f:
+            json.dump(cfg,f,ensure_ascii=False,indent=2);f.write('\n');f.flush();os.fsync(f.fileno())
+        os.chmod(path,0o600)
+        os.chown(path,0,0)
+        os.replace(path,CFG)
+    finally:
+        if os.path.exists(path): os.unlink(path)
+
+def main():
+    if os.geteuid()!=0: raise PermissionError('Administrator privileges required')
+    if len(sys.argv)!=2 or sys.argv[1] not in ('status','save','enable','disable','test','history'):
+        raise ValueError('Unknown operation')
+    op=sys.argv[1]
+    cfg=load()
+    if op=='status':
+        return {'config':{k:cfg[k] for k in ('join_message','leave_message','color')},'active':subprocess.run(['systemctl','is-active','--quiet',UNIT]).returncode==0,'enabled':subprocess.run(['systemctl','is-enabled','--quiet',UNIT]).returncode==0,'unit':cfg['unit']}
+    if op=='history':
+        result=subprocess.run(['journalctl','--no-pager','-o','cat','-u',UNIT,'-n','35'],capture_output=True,text=True,timeout=12)
+        return {'lines':result.stdout[-6500:]}
+    if op=='save':
+        raw=sys.stdin.read(8192)
+        patch=json.loads(raw)
+        if not isinstance(patch,dict) or set(patch)!= {'join_message','leave_message','color'}: raise ValueError('Unexpected settings')
+        cfg.update(patch)
+        validate(cfg)
+        was_active=subprocess.run(['systemctl','is-active','--quiet',UNIT]).returncode==0
+        write(cfg)
+        if was_active:
+            run('systemctl','restart',UNIT)
+            run('systemctl','is-active','--quiet',UNIT)
+        saved=load()
+        if any(saved[k]!=patch[k] for k in patch):
+            raise RuntimeError('Saved settings failed verification')
+        return {'message':'Settings saved and verified; announcer '+('restarted' if was_active else 'remained stopped')+'. Minecraft unchanged.', 'config':{k:saved[k] for k in ('join_message','leave_message','color')}}
+    if op=='enable':
+        run('systemctl','enable','--now',UNIT)
+        return {'message':'Join/leave announcer enabled.'}
+    if op=='disable':
+        run('systemctl','disable','--now',UNIT)
+        return {'message':'Join/leave announcer disabled. Minecraft stays running.'}
+    if op=='test':
+        if not EXEC.is_file(): raise ValueError('Announcer program missing')
+        spec=importlib.util.spec_from_file_location('minecraft_join_announcer_runtime',str(EXEC))
+        # extensionless Python executable: load as source explicitly
+        from importlib.machinery import SourceFileLoader
+        loader=SourceFileLoader('minecraft_join_announcer_runtime',str(EXEC))
+        import types
+        mod=types.ModuleType(loader.name)
+        loader.exec_module(mod)
+        mod.announce(cfg, cfg['join_message'].replace('{player}','TestPlayer'))
+        return {'message':'Test announcement sent to online players.'}
+
+if __name__=='__main__':
+    try: print(json.dumps({'ok':True,'data':main()},ensure_ascii=False))
+    except Exception as e:
+        print(json.dumps({'ok':False,'error':str(e)[:350]}));sys.exit(1)

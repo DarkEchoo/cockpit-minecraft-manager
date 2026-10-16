@@ -1,0 +1,1626 @@
+#!/usr/bin/env python3
+"""Narrow command helper for the Cockpit Minecraft page. Invoked through Cockpit superuser bridge."""
+import json, os, re, subprocess, sys, pathlib, urllib.request, hashlib, shutil, socket, time, secrets, pwd, fcntl, zipfile
+
+BASE=pathlib.Path(os.environ.get('COCKPIT_MC_MANAGED_BASE', '/opt/minecraft/managed'))
+REG=pathlib.Path('/etc/cockpit-minecraft/servers.json')
+MINECRAFT=pathlib.Path(os.environ.get('COCKPIT_MC_EXISTING_SERVER', '/opt/minecraft/server'))
+REPO=os.environ.get('COCKPIT_MC_BACKUP_REPO', '')
+KEY=os.environ.get('COCKPIT_MC_RESTIC_PASSWORD_FILE', '/etc/minecraft-backup/restic-password')
+MOUNT=os.environ.get('COCKPIT_MC_BACKUP_MOUNT', '')
+UUID=os.environ.get('COCKPIT_MC_BACKUP_UUID', '')
+MANIFEST='https://piston-meta.mojang.com/mc/game/version_manifest_v2.json'
+RCON_CONFIG_DIR=pathlib.Path('/etc/cockpit-minecraft/rcon')
+
+def run(cmd, timeout=45, check=True):
+    cp=subprocess.run(cmd,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout,check=False)
+    if check and cp.returncode: raise RuntimeError((cp.stderr or cp.stdout or 'Command failed').strip()[:1200])
+    return cp.stdout.strip()
+
+def registry():
+    if not REG.exists(): return {}
+    data=json.loads(REG.read_text())
+    if not isinstance(data,dict):raise ValueError('Corrupt registry')
+    return data
+
+def service_name(id):
+    if id=='neoforge':return 'minecraft-26.service'
+    if not re.fullmatch(r'[a-z][a-z0-9-]{1,34}',id) or id not in registry():raise ValueError('Unknown server')
+    return 'mc-managed-'+id+'.service'
+
+def info(id):
+    if id=='neoforge':return {'id':'neoforge','label':'NeoForge 26.2 (existing)','unit':'minecraft-26.service','path':str(MINECRAFT),'port':25565}
+    db=registry();s=db.get(id)
+    if not s:raise ValueError('Unknown server')
+    return {'id':id,'label':s.get('type','vanilla').capitalize()+' '+s['version']+' — '+id,'unit':service_name(id),'path':s['path'],'port':s['port'],'build':s.get('build','ready')}
+
+def state(unit):
+    s=run(['systemctl','is-active',unit],check=False)
+    return s or 'unknown'
+
+def get_json(url):
+    if not url.startswith('https://piston-meta.mojang.com/') and not url.startswith('https://launchermeta.mojang.com/'):
+        raise ValueError('Untrusted metadata URL')
+    req=urllib.request.Request(url,headers={'User-Agent':'cockpit-minecraft-manager/1.0'})
+    with urllib.request.urlopen(req,timeout=20) as response:
+        data=response.read(4_000_000)
+    return json.loads(data)
+
+def versions_manifest():return get_json(MANIFEST)
+
+def minecraft_versions():return [v['id'] for v in versions_manifest()['versions'] if v['type']=='release'][:35]
+
+def get_server_version(version):
+    if not re.fullmatch(r'[0-9][a-zA-Z0-9_.-]{0,29}',version):raise ValueError('Invalid version')
+    manifest=versions_manifest()
+    matches=[v for v in manifest['versions'] if v['type']=='release' and v['id']==version]
+    if not matches:raise ValueError('Version is not an official release')
+    details=get_json(matches[0]['url'])
+    dl=details.get('downloads',{}).get('server')
+    if not dl:raise ValueError('This release has no Java server download')
+    return dl
+
+def disk_check():
+    if not MOUNT or not UUID or not REPO:
+        raise RuntimeError('Backup mount, UUID, and repository must be configured before use')
+    got=run(['findmnt','-rn','-M',MOUNT,'-o','UUID'])
+    opts=run(['findmnt','-rn','-M',MOUNT,'-o','OPTIONS'])
+    if got!=UUID or 'rw' not in opts.split(','):raise RuntimeError('Correct writable backup HDD is not mounted')
+
+def chosen_server_path(name, requested=''):
+    """Allow dedicated server folders on mounted drives, not arbitrary system paths."""
+    raw=requested.strip() if requested else str(BASE/name)
+    dest=pathlib.Path(raw)
+    if not dest.is_absolute() or '..' in dest.parts or str(dest)=='/':
+        raise ValueError('Enter an absolute directory without ..')
+    if not (str(dest).startswith('/mnt/') or str(dest).startswith('/srv/minecraft/') or
+            str(dest).startswith('/opt/minecraft/')):
+        raise ValueError('Use a directory under /mnt, /srv/minecraft, or /opt/minecraft')
+    if dest.name!=name:raise ValueError('Server directory must end with its server ID: '+name)
+    if str(dest).startswith('/mnt/'):
+        mount=run(['findmnt','-rn','-T',str(dest.parent),'-o','TARGET'],check=False)
+        if mount in ('','/'):raise ValueError('Destination drive is not mounted; refusing to write to the system disk')
+    for candidate in (dest,*dest.parents):
+        if candidate.is_symlink():raise ValueError('Directory path cannot contain symlinks')
+    if dest.exists():raise ValueError('Target directory already exists')
+    if not dest.parent.is_dir():raise ValueError('Create and mount the destination parent directory first')
+    if not os.access(dest.parent,os.W_OK):
+        raise ValueError('Destination parent is not writable')
+    for item in registry().values():
+        existing=pathlib.Path(item['path'])
+        if dest==existing or dest in existing.parents or existing in dest.parents:
+            raise ValueError('Target overlaps an existing server directory')
+    return dest
+
+def managed_path(server_id):
+    return pathlib.Path(info(server_id)['path'])
+
+def save_registry(db):
+    REG.parent.mkdir(parents=True,exist_ok=True)
+    temp=REG.with_name(REG.name+'.tmp')
+    temp.write_text(json.dumps(db,indent=2)+'\n')
+    os.chown(temp,0,pwd.getpwnam('minecraft').pw_gid)
+    os.chmod(temp,0o640)
+    os.replace(temp,REG)
+
+def relocate_server(server_id, requested):
+    """Copy-first relocation. Never remove original data automatically."""
+    if server_id=='neoforge':raise ValueError('Existing NeoForge relocation is not supported')
+    service=service_name(server_id)
+    old=managed_path(server_id)
+    target=chosen_server_path(server_id,requested)
+    if not old.is_dir() or old.is_symlink():raise ValueError('Source directory unavailable')
+    for base, dirs, files in os.walk(old,followlinks=False):
+        if any((pathlib.Path(base)/n).is_symlink() for n in dirs+files):
+            raise ValueError('Relocation requires a server folder without symlinks')
+    with pathlib.Path('/run/lock/cockpit-minecraft-switch.lock').open('a+') as lock:
+        fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+        if state(service)!='inactive':raise ValueError('Stop the server before moving it')
+        if state('minecraft-backup.service') in ('active','activating','deactivating'):
+            raise ValueError('Backup in progress')
+        if registry()[server_id].get('type')=='spigot' and registry()[server_id].get('build')=='building':
+            raise ValueError('Wait for Spigot BuildTools to finish')
+        unit_path=pathlib.Path('/etc/systemd/system')/service
+        original=unit_path.read_text()
+        if 'WorkingDirectory='+str(old) not in original or str(old)+'/server.jar' not in original:
+            raise ValueError('Unexpected service configuration: refusing automated relocation')
+        # The old server remains untouched as a recovery copy. No rsync --delete.
+        try:
+            shutil.copytree(old,target,symlinks=False,copy_function=shutil.copy2)
+            for base,dirs,files in os.walk(target):
+                for name in dirs+files:shutil.chown(pathlib.Path(base)/name,user='minecraft',group='minecraft')
+            shutil.chown(target,user='minecraft',group='minecraft')
+            if not (target/'server.properties').is_file() or not (target/'server.jar').is_file():
+                raise RuntimeError('Copied server is missing required files')
+            updated=original.replace('WorkingDirectory='+str(old),'WorkingDirectory='+str(target)).replace(str(old)+'/server.jar',str(target)+'/server.jar').replace('ReadWritePaths='+str(old),'ReadWritePaths='+str(target))
+            if 'RequiresMountsFor=' in updated:
+                updated=re.sub(r'^RequiresMountsFor=.*$', 'RequiresMountsFor='+str(target), updated,flags=re.M)
+            else:
+                updated=updated.replace('[Unit]\n','[Unit]\nRequiresMountsFor='+str(target)+'\n',1)
+            unit_path.write_text(updated)
+            try:run(['systemctl','daemon-reload'])
+            except Exception:
+                unit_path.write_text(original);run(['systemctl','daemon-reload']);raise
+            db=registry();db[server_id]['path']=str(target)
+            try:save_registry(db)
+            except Exception:
+                unit_path.write_text(original);run(['systemctl','daemon-reload']);raise
+        except Exception:
+            # Leave any partial destination for examination rather than deleting data.
+            raise
+        return ('Relocation completed. New directory: '+str(target)+'. Original retained at: '+str(old)+
+                '. Verify startup, console, and backups before manually removing original files.')
+
+def do_create(name,version,port_s,server_type='vanilla',directory=''):
+    if server_type not in ('vanilla','spigot','paper','purpur'):raise ValueError('Unsupported type')
+    if server_type=='spigot':return do_create_spigot(name,version,port_s,directory)
+    if server_type in ('paper','purpur'):return do_create_jar_distribution(name,version,port_s,server_type,directory)
+    if not re.fullmatch(r'[a-z][a-z0-9-]{1,34}',name):raise ValueError('Use lowercase letters/numbers/dashes; start with a letter')
+    if name=='neoforge' or name in registry():raise ValueError('Name already used')
+    port=int(port_s)
+    current={25565,25575}
+    for s in registry().values():current.update([s['port']])
+    if port==0:
+        port=next(p for p in range(25566,25650) if p not in current)
+    if not 1024<=port<=65535 or port in current:raise ValueError('Port unavailable or reserved')
+    # Probe bind; cannot guarantee future port ownership, but prevents common conflicts.
+    with socket.socket() as sock:
+        try:sock.bind(('0.0.0.0',port))
+        except OSError:raise ValueError('Port is already in use')
+    target=chosen_server_path(name,directory)
+    if target.exists():raise ValueError('Target directory already exists')
+    dl=get_server_version(version)
+    url=dl['url']
+    if not url.startswith('https://piston-data.mojang.com/') and not url.startswith('https://launcher.mojang.com/'):
+        raise ValueError('Unexpected server download host')
+    target.mkdir(parents=True,mode=0o750)
+    try:
+        jar=target/'server.jar'
+        req=urllib.request.Request(url,headers={'User-Agent':'cockpit-minecraft-manager/1.0'})
+        with urllib.request.urlopen(req,timeout=30) as response,open(jar,'wb') as out:
+            # Avoid unbounded downloads; large server jars are less than this limit.
+            total=0
+            while True:
+                block=response.read(1024*1024)
+                if not block:break
+                total+=len(block)
+                if total>250*1024*1024:raise ValueError('Server download too large')
+                out.write(block)
+        h=hashlib.sha1(jar.read_bytes()).hexdigest()
+        if h!=dl['sha1']:raise RuntimeError('Downloaded server checksum mismatch')
+        (target/'eula.txt').write_text('eula=true\n')
+        (target/'server.properties').write_text(f'server-port={port}\nenable-rcon=false\nmax-players=20\nmotd=Managed Vanilla {version}\n')
+        (target/'README-Cockpit.txt').write_text('Created by Cockpit Minecraft Manager. Separate from NeoForge.\n')
+        shutil.chown(target,user='minecraft',group='minecraft')
+        for path in target.iterdir():shutil.chown(path,user='minecraft',group='minecraft')
+        os.chmod(target,0o750)
+        unit=f'mc-managed-{name}.service'
+        unit_path=pathlib.Path('/etc/systemd/system')/unit
+        if unit_path.exists():raise RuntimeError('Service unit already exists')
+        content=f'''[Unit]\nDescription=Cockpit managed Minecraft Vanilla {version} ({name})\nAfter=network-online.target\nWants=network-online.target\nRequiresMountsFor={target}\n\n[Service]\nType=simple\nUser=minecraft\nGroup=minecraft\nWorkingDirectory={target}\nExecStart=/usr/bin/java -Xms512M -Xmx2G -jar {target}/server.jar nogui\nRestart=on-failure\nRestartSec=10\nSuccessExitStatus=0 143\nNoNewPrivileges=true\nProtectSystem=strict\nReadWritePaths={target}\nPrivateTmp=true\n\n[Install]\nWantedBy=multi-user.target\n'''
+        unit_path.write_text(content)
+        os.chmod(unit_path,0o644)
+        run(['systemctl','daemon-reload'])
+        db=registry();db[name]={'type':'vanilla','version':version,'port':port,'path':str(target)}
+        REG.parent.mkdir(parents=True,exist_ok=True)
+        REG.write_text(json.dumps(db,indent=2)+'\n')
+        os.chown(REG,0,__import__('pwd').getpwnam('minecraft').pw_gid);os.chmod(REG,0o640)
+        rcon_note=enable_rcon(name)
+        return f'Created {unit} on port {port}. It is stopped and disabled. {rcon_note}'
+    except Exception:
+        # Fail conservatively; leave partial files for admin to inspect rather than deleting a server.
+        raise
+
+
+
+def public_json(url, hostname):
+    """Read bounded JSON from a fixed vendor hostname, with no cross-host redirects."""
+    from urllib.parse import urlparse
+    if urlparse(url).scheme!='https' or urlparse(url).hostname!=hostname:raise ValueError('Unexpected metadata host')
+    req=urllib.request.Request(url,headers={'User-Agent':'JesseHomelabCockpit/2.0 (https://github.com/PaperMC/Paper)'})
+    with urllib.request.urlopen(req,timeout=25) as response:
+        if urlparse(response.url).hostname!=hostname:raise ValueError('Unexpected metadata redirect')
+        raw=response.read(2_000_001)
+        if len(raw)>2_000_000:raise ValueError('Metadata too large')
+    return json.loads(raw)
+
+def distribution_release(kind, version):
+    if not re.fullmatch(r'[0-9][a-zA-Z0-9_.-]{0,29}',version):raise ValueError('Invalid version')
+    if kind=='paper':
+        host='fill.papermc.io'
+        builds=public_json(f'https://{host}/v3/projects/paper/versions/{version}/builds',host)
+        if not isinstance(builds,list):raise ValueError('Paper did not publish builds for this version')
+        stable=[x for x in builds if x.get('channel')=='STABLE' and isinstance(x.get('downloads'),dict) and x['downloads'].get('server:default')]
+        if not stable:raise ValueError('No STABLE Paper build available for this Minecraft version. Select another release.')
+        stable.sort(key=lambda x:int(x.get('id',0)),reverse=True)
+        meta=stable[0]['downloads']['server:default']
+        url=meta['url']
+        if not url.startswith('https://fill.papermc.io/') :raise ValueError('Paper download URL changed; aborting safely')
+        return url,meta.get('checksums',{}).get('sha256')
+    if kind=='purpur':
+        host='api.purpurmc.org'
+        meta=public_json(f'https://{host}/v2/purpur/{version}',host)
+        builds=meta.get('builds',{})
+        if not builds or not builds.get('latest'):raise ValueError('Purpur has no build for this Minecraft version')
+        build=str(builds['latest'])
+        if not re.fullmatch('[0-9]+',build):raise ValueError('Unrecognized Purpur build')
+        return f'https://{host}/v2/purpur/{version}/{build}/download',None
+    raise ValueError('Unsupported server distribution')
+
+def download_vendor_jar(url,target,sha256=None):
+    from urllib.parse import urlparse
+    permitted={'fill.papermc.io','api.purpurmc.org'}
+    if urlparse(url).hostname not in permitted or urlparse(url).scheme!='https':raise ValueError('Unknown download host')
+    req=urllib.request.Request(url,headers={'User-Agent':'JesseHomelabCockpit/2.0 (https://github.com/PaperMC/Paper)'})
+    with urllib.request.urlopen(req,timeout=90) as response:
+        # Purpur may redirect to a file CDN. Permit only HTTPS, not HTTP.
+        if urlparse(response.url).scheme!='https':raise ValueError('Unsafe download redirect')
+        with target.open('xb') as out:
+            digest=hashlib.sha256();size=0
+            while True:
+                part=response.read(1024*1024)
+                if not part:break
+                size+=len(part)
+                if size>250*1024*1024:raise ValueError('JAR download exceeded 250 MiB')
+                digest.update(part);out.write(part)
+            out.flush();os.fsync(out.fileno())
+    if sha256 and digest.hexdigest().lower()!=sha256.lower():raise ValueError('Vendor JAR SHA256 mismatch')
+    if not zipfile.is_zipfile(target):raise ValueError('Downloaded file is not a valid JAR')
+
+def do_create_jar_distribution(name,version,port_s,kind,directory=''):
+    """Create a new Paper/Purpur instance. Never run a third-party jar as root."""
+    if kind not in ('paper','purpur'):raise ValueError('Invalid distribution')
+    if not re.fullmatch(r'[a-z][a-z0-9-]{1,34}',name) or name=='neoforge' or name in registry():raise ValueError('Invalid or existing server name')
+    # Validate the release before making filesystem changes.
+    url,checksum=distribution_release(kind,version)
+    used={25565,25575,*[int(x['port']) for x in registry().values()]}
+    port=int(port_s)
+    if port==0:port=next(x for x in range(25566,25650) if x not in used)
+    if not 1024<=port<=65535 or port in used:raise ValueError('Port unavailable or reserved')
+    with socket.socket() as sock:
+        try:sock.bind(('0.0.0.0',port))
+        except OSError:raise ValueError('Port is already in use')
+    target=chosen_server_path(name,directory)
+    unit_path=pathlib.Path('/etc/systemd/system')/f'mc-managed-{name}.service'
+    if unit_path.exists():raise ValueError('A service unit already exists')
+    target.mkdir(mode=0o750)
+    # If any stage fails, leave the new isolated directory for inspection.
+    download_vendor_jar(url,target/'server.jar',checksum)
+    (target/'server.properties').write_text(f'server-port={port}\nenable-rcon=false\nmax-players=20\nmotd=Managed {kind.title()} {version}\n')
+    (target/'eula.txt').write_text('eula=true\n')
+    (target/'README-Cockpit.txt').write_text('Managed '+kind+' '+version+'. World data is not copied from other servers.\n')
+    shutil.chown(target,user='minecraft',group='minecraft')
+    for f in target.iterdir():shutil.chown(f,user='minecraft',group='minecraft')
+    os.chmod(target,0o750)
+    content=f"""[Unit]
+Description=Cockpit managed Minecraft {kind.title()} {version} ({name})
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor={target}
+
+[Service]
+Type=simple
+User=minecraft
+Group=minecraft
+WorkingDirectory={target}
+ExecStart=/usr/bin/java -Xms512M -Xmx2G -jar {target}/server.jar nogui
+Restart=on-failure
+RestartSec=10
+SuccessExitStatus=0 143
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths={target}
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+"""
+    unit_path.write_text(content);os.chmod(unit_path,0o644)
+    run(['systemctl','daemon-reload'])
+    db=registry();db[name]={'type':kind,'version':version,'port':port,'path':str(target)}
+    save_registry(db)
+    note=enable_rcon(name)
+    return f'Created {kind.title()} {version} on port {port}. Server remains stopped and disabled. {note}'
+
+def upgrade_vanilla(server_id, version):
+    """Stopped managed Vanilla server only. Never modifies worlds or legacy NeoForge."""
+    if server_id == 'neoforge':
+        raise ValueError('Legacy NeoForge requires its own loader-aware upgrade path')
+    db=registry()
+    if server_id not in db or db[server_id].get('type')!='vanilla':
+        raise ValueError('Automated upgrades currently support managed Vanilla only')
+    service=service_name(server_id)
+    if state(service) not in ('inactive','failed'):
+        raise ValueError('Stop this server before upgrading. No players will be disconnected automatically.')
+    path=managed_path(server_id)
+    if path.is_symlink() or not path.is_dir() or not (path/'server.jar').is_file():
+        raise ValueError('Unsafe or incomplete server directory')
+    if version==db[server_id]['version']:
+        raise ValueError('Selected version is already installed')
+    # Mojang supplies SHA-1 checksums for official server downloads.
+    dl=get_server_version(version)
+    url=dl['url']
+    if not url.startswith(('https://piston-data.mojang.com/','https://launcher.mojang.com/')):
+        raise ValueError('Unexpected download host')
+    with pathlib.Path('/run/lock/cockpit-minecraft-switch.lock').open('a+') as lock:
+        fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+        if state(service) not in ('inactive','failed'):
+            raise ValueError('Server started while waiting; aborting')
+        candidate=path/'.server-upgrade-download.jar'
+        if candidate.exists():raise ValueError('An upgrade staging file already exists; inspect it before retrying')
+        previous=path/('server-before-upgrade-'+time.strftime('%Y%m%d-%H%M%S')+'.jar')
+        try:
+            req=urllib.request.Request(url,headers={'User-Agent':'cockpit-minecraft-manager/1.1'})
+            digest=hashlib.sha1(); size=0
+            with urllib.request.urlopen(req,timeout=40) as response,open(candidate,'xb') as dest:
+                while True:
+                    data=response.read(1024*1024)
+                    if not data:break
+                    size+=len(data)
+                    if size>250*1024*1024:raise RuntimeError('Server jar exceeds permitted size')
+                    digest.update(data);dest.write(data)
+                dest.flush();os.fsync(dest.fileno())
+            if digest.hexdigest()!=dl['sha1']:
+                raise RuntimeError('Server jar SHA-1 did not match Mojang metadata')
+            shutil.chown(candidate,user='minecraft',group='minecraft');os.chmod(candidate,0o640)
+            current=path/'server.jar'
+            os.replace(current,previous)
+            try:
+                os.replace(candidate,current)
+                newdb=registry()
+                if newdb[server_id].get('version') != db[server_id]['version']:
+                    raise RuntimeError('Registry changed during upgrade')
+                newdb[server_id]['version']=version
+                save_registry(newdb)
+            except Exception:
+                if current.exists():os.replace(current,candidate)
+                os.replace(previous,current)
+                raise
+            return {'server':server_id,'from':db[server_id]['version'],'to':version,
+                    'rollback_jar':str(previous),'state':'stopped',
+                    'notice':'Jar updated; worlds unchanged. The server was NOT started. Check version compatibility before starting. Restore the saved jar and registry version to roll back.'}
+        finally:
+            if candidate.exists():candidate.unlink()
+
+# Spigot jars must be built locally through the official SpigotMC BuildTools.
+BUILD_URL='https://hub.spigotmc.org/jenkins/job/BuildTools/lastSuccessfulBuild/artifact/target/BuildTools.jar'
+
+def do_create_spigot(name,version,port_s,directory=''):
+    if not re.fullmatch(r'[a-z][a-z0-9-]{1,34}',name):raise ValueError('Invalid server name')
+    if name=='neoforge' or name in registry():raise ValueError('Name already used')
+    # Only choose official Minecraft release identifiers; BuildTools might not support a new release yet.
+    if version not in minecraft_versions():raise ValueError('Choose an official release from the version picker')
+    if shutil.which('git') is None or shutil.which('java') is None:raise RuntimeError('Install git and a compatible JDK first')
+    port=int(port_s)
+    used={25565,25575,*[s['port'] for s in registry().values()]}
+    if port==0:port=next(x for x in range(25566,25650) if x not in used)
+    if not (1024<=port<=65535) or port in used:raise ValueError('Port unavailable or reserved')
+    with socket.socket() as sock:
+        try:sock.bind(('0.0.0.0',port))
+        except OSError:raise ValueError('Port already in use')
+    target=chosen_server_path(name,directory)
+    if target.exists():raise ValueError('Target already exists')
+    # Stage everything separately; do not modify the existing NeoForge installation.
+    target.mkdir(parents=True,mode=0o750)
+    try:
+        (target/'build').mkdir(mode=0o750)
+        (target/'server.properties').write_text(f'server-port={port}\nenable-rcon=false\nmax-players=20\nmotd=Managed Spigot {version}\n')
+        (target/'eula.txt').write_text('eula=true\n')
+        (target/'README-Cockpit.txt').write_text('Separate Spigot server built via official BuildTools.\n')
+        for f in (target,*target.iterdir()):shutil.chown(f,user='minecraft',group='minecraft')
+        os.chmod(target,0o750)
+        unit=f'mc-managed-{name}.service'
+        unit_path=pathlib.Path('/etc/systemd/system')/unit
+        if unit_path.exists():raise RuntimeError('Service already exists')
+        content=f"""[Unit]\nDescription=Cockpit managed Minecraft Spigot {version} ({name})\nAfter=network-online.target\nWants=network-online.target\nRequiresMountsFor={target}\n\n[Service]\nType=simple\nUser=minecraft\nGroup=minecraft\nWorkingDirectory={target}\nExecStart=/usr/bin/java -Xms512M -Xmx2G -jar {target}/server.jar nogui\nRestart=on-failure\nRestartSec=10\nSuccessExitStatus=0 143\nNoNewPrivileges=true\nProtectSystem=strict\nReadWritePaths={target}\nPrivateTmp=true\n\n[Install]\nWantedBy=multi-user.target\n"""
+        unit_path.write_text(content)
+        os.chmod(unit_path,0o644)
+        run(['systemctl','daemon-reload'])
+        db=registry();db[name]={'type':'spigot','version':version,'port':port,'path':str(target),'build':'building'}
+        REG.parent.mkdir(parents=True,exist_ok=True)
+        REG.write_text(json.dumps(db,indent=2)+'\n');os.chown(REG,0,__import__('pwd').getpwnam('minecraft').pw_gid);os.chmod(REG,0o640)
+        # Provision the isolated RCON credentials before the first Spigot boot.
+        rcon_note=enable_rcon(name, allow_building=True)
+        # Run BuildTools asynchronously as unprivileged minecraft user.
+        build_unit='mc-spigot-build-'+name
+        run(['systemd-run','--collect','--unit',build_unit,
+             '--property=User=minecraft','--property=Group=minecraft',
+             '--property=WorkingDirectory='+str(target/'build'),
+             '--property=NoNewPrivileges=yes','--property=ProtectSystem=strict',
+             '--property=ReadWritePaths='+str(target),
+             '--property=TimeoutStartSec=1800',
+             '/usr/bin/python3','/usr/local/libexec/cockpit-minecraft-helper','build-spigot',name],timeout=20)
+        return f'Spigot {version} build started in background. {rcon_note} Select the server, then check Build status and logs before starting.'
+    except Exception:
+        # Keep partial build files for troubleshooting; do not overwrite any world.
+        raise
+
+def build_spigot_worker(name):
+    if not re.fullmatch(r'[a-z][a-z0-9-]{1,34}',name):raise ValueError('Invalid build name')
+    # The worker is run only as minecraft. Registry is root-controlled.
+    if os.geteuid()==0:raise PermissionError('BuildTools may not run as root')
+    if os.geteuid()!=__import__('pwd').getpwnam('minecraft').pw_uid:raise PermissionError('Wrong worker user')
+    s=registry().get(name)
+    if not s or s.get('type')!='spigot' or s.get('build')!='building':raise ValueError('Unknown pending Spigot build')
+    target=managed_path(name)
+    if pathlib.Path(s['path'])!=target:raise ValueError('Invalid build path')
+    build=target/'build';log=target/'build.log'
+    with log.open('a',buffering=1) as out:
+        try:
+            out.write('Downloading SpigotMC BuildTools...\n')
+            req=urllib.request.Request(BUILD_URL,headers={'User-Agent':'cockpit-minecraft-manager/1.1'})
+            jar=build/'BuildTools.jar';size=0
+            with urllib.request.urlopen(req,timeout=60) as response,jar.open('wb') as dst:
+                if response.url.split('/')[2]!='hub.spigotmc.org' or not response.url.startswith('https://'):raise RuntimeError('Unexpected BuildTools redirect')
+                while True:
+                    block=response.read(1024*1024)
+                    if not block:break
+                    size+=len(block)
+                    if size>50*1024*1024:raise RuntimeError('BuildTools download too large')
+                    dst.write(block)
+            out.write('Running BuildTools --rev '+s['version']+' (this may take several minutes)...\n')
+            env=os.environ.copy();env['MAVEN_OPTS']='-Xmx2G'
+            cp=subprocess.run(['java','-Xmx2G','-jar',str(jar),'--rev',s['version']],cwd=build,env=env,stdout=out,stderr=subprocess.STDOUT,timeout=1500)
+            if cp.returncode:raise RuntimeError('BuildTools exited with code '+str(cp.returncode))
+            jars=sorted(build.glob('spigot-*.jar'),key=lambda p:p.stat().st_mtime,reverse=True)
+            if not jars:raise RuntimeError('BuildTools did not produce a spigot-*.jar')
+            shutil.copyfile(jars[0],target/'server.jar')
+            (target/'build-success').write_text('Built Spigot '+s['version']+'\n')
+            out.write('SUCCESS: server.jar created. Refresh server list, then Start.\n')
+        except Exception as ex:
+            (target/'build-failed').write_text(str(ex)[:500]+'\n')
+            out.write('BUILD FAILED: '+str(ex)+'\n')
+            raise
+
+def build_status(name):
+    s=registry().get(name)
+    if not s or s.get('type')!='spigot':raise ValueError('Unknown Spigot server')
+    target=managed_path(name)
+    status='ready' if (target/'build-success').exists() and (target/'server.jar').is_file() else 'failed' if (target/'build-failed').exists() else 'building'
+    log=target/'build.log'
+    if log.exists():
+        with log.open('rb') as f:
+            f.seek(0,2);length=f.tell();f.seek(max(0,length-16000));chunk=f.read().decode('utf-8',errors='replace')
+    else:chunk='Waiting for build worker...'
+    return {'status':status,'log':chunk[-14000:]}
+
+def rcon_ready(server_id):
+    if server_id=='neoforge':return True
+    service_name(server_id)
+    path=RCON_CONFIG_DIR/(server_id+'.conf')
+    return path.is_file()
+
+def reserve_rcon_port(server_id):
+    used={25575}
+    for conf in RCON_CONFIG_DIR.glob('*.conf') if RCON_CONFIG_DIR.exists() else []:
+        try:
+            match=re.search(r'^port\s*=\s*(\d+)\s*$',conf.read_text(),re.M)
+            if match:used.add(int(match.group(1)))
+        except OSError:pass
+    for n in range(25576,25650):
+        if n in used or any(x.get('port')==n for x in registry().values()):continue
+        with socket.socket() as sock:
+            try:sock.bind(('127.0.0.1',n))
+            except OSError:continue
+        return n
+    raise RuntimeError('No free RCON port in 25576-25649')
+
+def protect_rcon_port(port):
+    if not shutil.which('ufw'):raise RuntimeError('UFW is required to protect managed RCON ports')
+    status=run(['ufw','status'],timeout=15)
+    if not status.startswith('Status: active'):
+        raise RuntimeError('UFW is not active; refusing to enable network-listening RCON')
+    # Add a deny before loopback allow: fail closed even if the next call fails.
+    run(['ufw','--force','insert','1','deny','in','to','any','port',str(port),'proto','tcp'],timeout=30)
+    run(['ufw','--force','insert','1','allow','in','on','lo','to','any','port',str(port),'proto','tcp'],timeout=30)
+
+def enable_rcon(server_id, allow_building=False):
+    if server_id=='neoforge':return 'NeoForge RCON is already configured.'
+    server=info(server_id)
+    if state(server['unit'])=='active':
+        raise RuntimeError('Stop this server before enabling RCON. World files will not be changed.')
+    if not allow_building and server.get('build')=='building' and not (managed_path(server_id)/'build-success').exists():
+        raise RuntimeError('Wait for the Spigot build to finish first.')
+    target=managed_path(server_id)
+    props=target/'server.properties'
+    if not props.is_file():raise RuntimeError('Missing server.properties')
+    conf=RCON_CONFIG_DIR/(server_id+'.conf')
+    if conf.exists():return 'RCON already configured. Start server and send commands.'
+    # Do not change an existing unknown RCON configuration or overwrite credentials.
+    content=props.read_text()
+    values=dict(re.findall(r'^(enable-rcon|rcon.port|rcon.password|server-ip)[ \t]*=[ \t]*(.*)$',content,re.M))
+    if values.get('enable-rcon','false').strip().lower()=='true' or values.get('rcon.password','').strip():
+        raise RuntimeError('Existing manual RCON configuration found. Refusing to overwrite it.')
+    port=reserve_rcon_port(server_id)
+    protect_rcon_port(port)
+    password=secrets.token_urlsafe(32)
+    updates={'enable-rcon':'true','rcon.port':str(port),'rcon.password':password,'broadcast-rcon-to-ops':'false'}
+    rewritten=[]
+    for line in content.splitlines():
+        if line and not line.lstrip().startswith('#') and '=' in line:
+            key=line.split('=',1)[0].strip()
+            if key in updates:
+                rewritten.append(key+'='+updates.pop(key));continue
+        rewritten.append(line)
+    rewritten.extend(key+'='+value for key,value in updates.items())
+    # A full rollback copy remains beside the config until the server is tested.
+    backup=props.with_name('server.properties.pre-rcon')
+    if not backup.exists():shutil.copy2(props,backup)
+    tmp=props.with_name('.server.properties.rcon-tmp')
+    tmp.write_text('\n'.join(rewritten)+'\n')
+    shutil.chown(tmp,user='minecraft',group='minecraft');os.chmod(tmp,0o600)
+    os.replace(tmp,props)
+    # rconclt configuration is held outside the web-served Cockpit package.
+    RCON_CONFIG_DIR.mkdir(parents=True,exist_ok=True)
+    os.chown(RCON_CONFIG_DIR,0,0);os.chmod(RCON_CONFIG_DIR,0o700)
+    temp=RCON_CONFIG_DIR/(server_id+'.conf.tmp')
+    temp.write_text(f'[{server_id}]\nhost = 127.0.0.1\nport = {port}\npasswd = {password}\n')
+    os.chown(temp,0,0);os.chmod(temp,0o600)
+    os.replace(temp,conf)
+    return f'RCON protected by UFW (localhost allowed, external denied) on port {port}. Start {server_id}, then use the console. Credentials are root-only.'
+
+def rcon_command(server_id,cmd):
+    if not 1<=len(cmd)<=240 or any(ord(ch)<32 for ch in cmd):raise ValueError('Invalid command')
+    unit=service_name(server_id)
+    if state(unit)!='active':raise RuntimeError(f'{server_id} is offline')
+    if server_id=='neoforge':
+        return run(['/usr/bin/rconclt','-c','/etc/minecraft-backup/rcon.conf','-t','5','neoforge',cmd],timeout=12)
+    conf=RCON_CONFIG_DIR/(server_id+'.conf')
+    if not conf.exists():raise RuntimeError('RCON not configured. Stop server and click Enable RCON.')
+    return run(['/usr/bin/rconclt','-c',str(conf),'-t','5',server_id,cmd],timeout=12)
+
+def broadcast_announcement(server_id, message):
+    # No arbitrary command input: only a single fixed say command.
+    if not isinstance(message, str):
+        raise ValueError('Message must be text')
+    message = message.strip()
+    if not 1 <= len(message) <= 140 or any(ord(c) < 32 or ord(c) == 127 for c in message):
+        raise ValueError('Announcement must contain 1–140 printable characters')
+    if message.startswith('/'):
+        raise ValueError('Announcements cannot begin with a slash')
+    return rcon_command(server_id, 'say ' + message)
+
+def switch_server(target):
+    """Exclusive, serialized switch through the helper; no changes to existing unit files."""
+    target_unit=service_name(target)  # Validate before touching any running service.
+    if target!='neoforge' and registry()[target].get('type')=='spigot' and not (managed_path(target)/'build-success').exists():
+        raise RuntimeError('Spigot build has not finished')
+    # Serialize all UI/CLI switch and start/restart operations across helper processes.
+    lockfile=pathlib.Path('/run/lock/cockpit-minecraft-switch.lock')
+    with lockfile.open('a+') as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if state('minecraft-backup.service') in ('active','activating','deactivating'):
+            raise RuntimeError('Minecraft manual backup is in progress. Switch cancelled.')
+        ids=['neoforge',*sorted(registry())]
+        # Refuse switches if the target or another instance is in an indeterminate state.
+        for sid in ids:
+            st=state(service_name(sid))
+            if st in ('activating','deactivating','reloading'):
+                raise RuntimeError(f'{sid} is currently {st}. Try again shortly.')
+        others=[sid for sid in ids if sid!=target and state(service_name(sid))=='active']
+        stopped=[]
+        for sid in others:
+            unit=service_name(sid)
+            try:
+                run(['systemctl','stop',unit],timeout=180)
+            except Exception as exc:
+                raise RuntimeError(f'Failed stopping {sid}; did not start {target}: {exc}')
+            if state(unit)!='inactive':
+                raise RuntimeError(f'{sid} did not reach inactive state; did not start {target}')
+            stopped.append(sid)
+        if state(target_unit)!='active':
+            try:run(['systemctl','start',target_unit],timeout=180)
+            except Exception as exc:
+                raise RuntimeError(f'Stopped {stopped}, but {target} failed to start: {exc}. No automatic rollback was attempted.')
+        newstate=state(target_unit)
+        if newstate!='active':
+            raise RuntimeError(f'Stopped {stopped}, but {target} is {newstate}. Review its journal.')
+        return {'stopped':stopped,'started':target,'state':newstate}
+
+
+# Per-managed-server backup settings; NeoForge retains its existing backup service.
+BACKUP_SETTINGS=pathlib.Path('/etc/cockpit-minecraft/backup-settings.json')
+TIMER_DIR=pathlib.Path('/etc/systemd/system')
+
+def backup_config():
+    if not BACKUP_SETTINGS.exists():return {}
+    obj=json.loads(BACKUP_SETTINGS.read_text())
+    if not isinstance(obj,dict):raise ValueError('Backup settings invalid')
+    return obj
+
+def backup_settings_for(server_id):
+    service_name(server_id)
+    c=backup_config().get(server_id,{})
+    return {'repository':REPO if server_id=='neoforge' else c.get('repository',REPO),
+            'restore_export':c.get('restore_export',''),
+            'schedule':c.get('schedule','off'), 'interval_minutes':c.get('interval_minutes',1440),
+            'legacy_repository_locked':server_id=='neoforge',
+            'next_run':run(['systemctl','show','--value','-p','NextElapseUSecRealtime',
+                'cockpit-mc-backup-'+server_id+'.timer'],check=False) if c.get('schedule','off')!='off' else ''}
+
+def checked_directory(value,existing_repo=False):
+    if not isinstance(value,str) or len(value)>250:raise ValueError('Invalid directory')
+    path=pathlib.Path(value)
+    if not path.is_absolute() or '..' in path.parts or path==pathlib.Path('/'):
+        raise ValueError('Use an absolute directory without ..')
+    if not (str(path).startswith('/mnt/') or str(path).startswith('/srv/')):
+        raise ValueError('Directories must be under /mnt or /srv')
+    for part in (path,*path.parents):
+        if part.is_symlink():raise ValueError('Symlink in path not allowed')
+    if existing_repo and not (path/'config').is_file():
+        raise ValueError('Existing initialized Restic repository required; no new repository is created')
+    base=path if path.exists() else path.parent
+    if not base.is_dir():raise ValueError('Directory or its parent does not exist')
+    mount=run(['findmnt','-rn','-T',str(base),'-o','TARGET'],check=False)
+    if mount in ('','/'):
+        raise ValueError('Destination must be on a separately mounted filesystem')
+    opts=run(['findmnt','-rn','-T',str(base),'-o','OPTIONS'],check=False)
+    if 'rw' not in opts.split(','):raise ValueError('Destination mount is not writable')
+    return str(path)
+
+def repo_for(server_id):
+    if server_id=='neoforge':disk_check();return REPO
+    repo=backup_settings_for(server_id)['repository']
+    checked_directory(repo,True)
+    if not pathlib.Path(KEY).is_file():raise RuntimeError('Restic password file missing')
+    return repo
+
+def save_backup_settings(server_id, repository, restore_export, schedule, interval):
+    service_name(server_id)
+    valid=['off','hourly','6hours','12hours','daily','weekly','custom']
+    if schedule not in valid:raise ValueError('Invalid backup schedule')
+    try:interval=int(interval)
+    except (TypeError,ValueError):raise ValueError('Custom interval must be a number')
+    if interval<15 or interval>10080:raise ValueError('Custom interval must be 15–10080 minutes')
+    if server_id=='neoforge':
+        if repository!=REPO:raise ValueError('NeoForge repository belongs to the existing backup service; cannot change here')
+    else:
+        checked_directory(repository,True)
+        if not pathlib.Path(KEY).is_file():raise ValueError('Restic password file missing')
+        # Confirm existing repository unlocks with the configured key; do not initialize/migrate it.
+        run(['restic','--repo',repository,'--password-file',KEY,'snapshots','--json'],timeout=90)
+    if restore_export:
+        checked_directory(restore_export,False)
+        exp=pathlib.Path(restore_export).resolve()
+        for protected in (pathlib.Path(REPO), pathlib.Path(repository), pathlib.Path('/opt/minecraft')):
+            if exp==protected or exp in protected.parents or protected in exp.parents:
+                raise ValueError('Export directory overlaps a protected Minecraft or repository location')
+        if pathlib.Path(restore_export).exists() and list(pathlib.Path(restore_export).iterdir()):
+            raise ValueError('Restore export directory must be empty')
+    config=backup_config()
+    config[server_id]={'repository':repository,'restore_export':restore_export,
+                       'schedule':schedule,'interval_minutes':interval}
+    BACKUP_SETTINGS.parent.mkdir(parents=True,exist_ok=True)
+    import tempfile
+    fd,tmp=tempfile.mkstemp(dir=str(BACKUP_SETTINGS.parent),prefix='.backup-settings-')
+    try:
+        os.fchmod(fd,0o600)
+        with os.fdopen(fd,'w') as stream:json.dump(config,stream,indent=2)
+        os.replace(tmp,BACKUP_SETTINGS)
+    finally:
+        if os.path.exists(tmp):os.unlink(tmp)
+    name='cockpit-mc-backup-'+server_id
+    timer=TIMER_DIR/(name+'.timer')
+    service=TIMER_DIR/(name+'.service')
+    if schedule=='off':
+        run(['systemctl','disable','--now',name+'.timer'],check=False)
+        # Preserve past timer/service files as records if disabled.
+    else:
+        minutes={'hourly':60,'6hours':360,'12hours':720,'daily':1440,'weekly':10080,'custom':interval}[schedule]
+        # Timer is relative to prior activation, including after reboot; it never launches at install.
+        service.write_text('[Unit]\nDescription=Minecraft scheduled backup '+server_id+'\n[Service]\nType=oneshot\nExecStart=/usr/local/libexec/cockpit-minecraft-helper backup '+server_id+'\nTimeoutStartSec=2100\n')
+        timer.write_text('[Unit]\nDescription=Minecraft backup timer '+server_id+'\n[Timer]\nOnBootSec='+str(minutes)+'min\nOnUnitActiveSec='+str(minutes)+'min\nUnit='+name+'.service\n[Install]\nWantedBy=timers.target\n')
+        run(['systemctl','daemon-reload'])
+        run(['systemctl','enable','--now',name+'.timer'])
+        run(['systemctl','restart',name+'.timer'])
+    return backup_settings_for(server_id)
+
+def create_with_backup(name,version,port_s,server_type,directory,repository,restore_export,schedule,interval):
+    # Preflight backup settings before starting a potentially lengthy server installation.
+    # Never initialize, move, or overwrite a Restic repository during creation.
+    if not re.fullmatch(r'[a-z][a-z0-9-]{1,34}',name) or name=='neoforge' or name in registry():
+        raise ValueError('Invalid or existing server name')
+    if schedule not in ('off','hourly','6hours','12hours','daily','weekly','custom'):
+        raise ValueError('Invalid backup schedule')
+    try:interval=int(interval)
+    except (ValueError,TypeError):raise ValueError('Invalid backup interval')
+    if not 15<=interval<=10080:raise ValueError('Backup interval must be between 15 and 10080 minutes')
+    repository=repository.strip() or REPO
+    if not repository:raise ValueError('Configure an existing Restic repository before creating a server')
+    checked_directory(repository,True)
+    if not pathlib.Path(KEY).is_file():raise ValueError('Restic password file missing')
+    # Verify repository can actually be decrypted, even for manual-only schedules.
+    run(['restic','--repo',repository,'--password-file',KEY,'snapshots','--json'],timeout=90)
+    if restore_export:
+        checked_directory(restore_export,False)
+        exp=pathlib.Path(restore_export).resolve()
+        for protected in (pathlib.Path(REPO),pathlib.Path(repository),pathlib.Path('/opt/minecraft')):
+            if exp==protected or exp in protected.parents or protected in exp.parents:
+                raise ValueError('Export location overlaps protected server/repository data')
+        if exp.exists() and any(exp.iterdir()):raise ValueError('Restore export directory must be empty')
+    created=do_create(name,version,port_s,server_type,directory)
+    try:
+        saved=save_backup_settings(name,repository,restore_export,schedule,interval)
+    except Exception as ex:
+        # Report partial success clearly. Never remove created servers automatically.
+        raise RuntimeError('Server created, but backup settings failed. Server remains stopped. '
+                           'Open Backups for server '+name+' and configure settings manually: '+str(ex)) from ex
+    return {'server':created,'backup_schedule':saved['schedule'],'repository':saved['repository'],
+            'restore_export':saved['restore_export']}
+
+def export_restore_snapshot(server_id,snapshot_id):
+    # Export is separate from the live restore and never overwrites any server.
+    if not re.fullmatch(r'[a-f0-9]{64}',snapshot_id):raise ValueError('Invalid snapshot ID')
+    conf=backup_settings_for(server_id)
+    if not conf['restore_export']:raise ValueError('Set a restore export folder first')
+    target=pathlib.Path(checked_directory(conf['restore_export']))
+    if target.exists() and any(target.iterdir()):raise ValueError('Export directory must be empty')
+    if target.exists() and target.is_symlink():raise ValueError('Symlink export directory not allowed')
+    if snapshot_id not in {x['id'] for x in snapshot_objects(server_id)}:
+        raise ValueError('Snapshot does not belong to selected server')
+    target.mkdir(parents=True,exist_ok=True)
+    run(['restic','--repo',repo_for(server_id),'--password-file',KEY,
+         'restore',snapshot_id,'--target',str(target)],timeout=1800)
+    return 'Snapshot exported to '+str(target)+'. Live server files unchanged.'
+
+def backup_selected(server_id):
+    """Stop selected running server, snapshot its own directory, restart in finally."""
+    server=info(server_id)
+    if server_id=='neoforge':
+        # Never replace the existing, tested NeoForge service or its backup tags.
+        disk_check()
+        run(['systemctl','start','minecraft-backup.service'],timeout=1850)
+        return 'Existing NeoForge manual backup completed. Check its snapshot history.'
+    repo=repo_for(server_id)
+    source=managed_path(server_id)
+    if not source.is_dir() or source.is_symlink():raise RuntimeError('Managed server path mismatch')
+    unit=server['unit']
+    # Same lock as exclusive switch. No two backups or switches can interleave.
+    with pathlib.Path('/run/lock/cockpit-minecraft-switch.lock').open('a+') as lock:
+        fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+        if state('minecraft-backup.service') in ('active','activating','deactivating'):
+            raise RuntimeError('NeoForge backup already running')
+        initial=state(unit)
+        if initial not in ('active','inactive','failed'):
+            raise RuntimeError('Server is changing state; retry later')
+        restart=(initial=='active')
+        stopped=False
+        try:
+            if restart:
+                run(['systemctl','stop',unit],timeout=180)
+                if state(unit)!='inactive':raise RuntimeError('Server did not stop cleanly; no backup performed')
+                stopped=True
+            # An offline world can be backed up without starting it.
+            snap=run(['restic','--repo',repo,'--password-file',KEY,
+                      'backup',str(source),'--tag','cockpit-minecraft','--tag','mc-server-'+server_id],timeout=1800)
+            return 'Restic backup completed for '+server_id+'.\n'+snap[-1600:]
+        finally:
+            if stopped:
+                try:run(['systemctl','start',unit],timeout=180)
+                except Exception as exc:
+                    raise RuntimeError('IMPORTANT: Backup ended, but '+server_id+' could not restart: '+str(exc))
+
+def snapshots_selected(server_id):
+    service_name(server_id)
+    repo=repo_for(server_id)
+    tag='minecraft-manual' if server_id=='neoforge' else 'mc-server-'+server_id
+    return run(['restic','--repo',repo,'--password-file',KEY,'snapshots','--tag',tag],timeout=60)
+
+
+# File manager permits only explicit server-owned content categories. The browser
+# never supplies absolute paths to be read or written by this privileged helper.
+CONFIG_EXT={'.properties','.json','.toml','.yml','.yaml','.cfg','.conf','.txt'}
+CONFIG_ROOT={'server.properties','bukkit.yml','spigot.yml','commands.yml','permissions.yml','whitelist.json','ops.json','banned-ips.json','banned-players.json'}
+CONFIG_DIRS={'config','defaultconfigs'}
+UPLOAD_DIRS={'mods','plugins','resourcepacks'}
+
+def file_root(server_id):
+    s=info(server_id)
+    root=pathlib.Path(s['path'])
+    expected=MINECRAFT if server_id=='neoforge' else managed_path(server_id)
+    if root!=expected or not root.is_dir() or root.is_symlink():
+        raise ValueError('Untrusted server directory')
+    return root
+
+def validated_relative(rel):
+    p=pathlib.PurePosixPath(rel)
+    if (not rel or len(rel)>220 or rel.startswith('/') or '\\' in rel or
+            any(x in ('','.', '..') for x in rel.split('/')) or p.is_absolute()):
+        raise ValueError('Invalid relative file path')
+    return p
+
+def secure_path(root,rel):
+    p=validated_relative(rel)
+    target=root
+    for item in p.parts:
+        target=target/item
+        if target.is_symlink():raise ValueError('Symlinks are not permitted')
+    if not target.resolve(strict=False).is_relative_to(root.resolve()):
+        raise ValueError('Path escapes server directory')
+    return target
+
+def config_path(server_id,rel):
+    root=file_root(server_id)
+    p=validated_relative(rel)
+    if not ((len(p.parts)==1 and p.name in CONFIG_ROOT) or
+            (2<=len(p.parts)<=5 and p.parts[0] in CONFIG_DIRS and p.suffix.lower() in CONFIG_EXT)):
+        raise ValueError('Only supported configuration files can be edited')
+    if p.name.lower() in ('rcon.conf','rcon.password','user_jvm_args.txt'):
+        raise ValueError('Protected configuration file')
+    return secure_path(root,rel)
+
+def ensure_stopped(server_id):
+    status=state(service_name(server_id))
+    if status != 'inactive':
+        raise RuntimeError('Stop '+server_id+' before changing server files (currently '+status+')')
+    if state('minecraft-backup.service') in ('active','activating','deactivating'):
+        raise RuntimeError('Cannot modify files during Minecraft backup')
+
+def file_catalog(server_id):
+    root=file_root(server_id); result=[]
+    for name in sorted(CONFIG_ROOT):
+        p=secure_path(root,name)
+        if p.is_file() and p.stat().st_size<=1024*1024:
+            result.append({'path':name,'bytes':p.stat().st_size,'kind':'config'})
+    for folder in sorted(CONFIG_DIRS):
+        d=secure_path(root,folder)
+        if not d.is_dir():continue
+        for parent, dirs, files in os.walk(d,followlinks=False):
+            relative=pathlib.Path(parent).relative_to(d)
+            dirs[:]=[x for x in dirs if not (pathlib.Path(parent)/x).is_symlink() and len(relative.parts)<3]
+            for name in files:
+                p=pathlib.Path(parent)/name
+                if p.is_symlink() or p.suffix.lower() not in CONFIG_EXT:continue
+                rel=p.relative_to(root).as_posix()
+                try:
+                    config_path(server_id,rel)
+                    if p.stat().st_size <=1024*1024:
+                        result.append({'path':rel,'bytes':p.stat().st_size,'kind':'config'})
+                except (ValueError,OSError):pass
+                if len(result)>=300:break
+            if len(result)>=300:break
+    for folder in sorted(UPLOAD_DIRS):
+        if folder=='plugins' and server_id=='neoforge':continue
+        if folder=='plugins' and server_id!='neoforge' and registry()[server_id].get('type')!='spigot':continue
+        if folder=='mods' and server_id!='neoforge':continue
+        d=secure_path(root,folder)
+        if d.is_dir():
+            for p in sorted(d.iterdir()):
+                if p.is_file() and not p.is_symlink():
+                    result.append({'path':p.relative_to(root).as_posix(),'bytes':p.stat().st_size,'kind':'upload'})
+    icon=secure_path(root,'server-icon.png')
+    if icon.is_file():result.append({'path':'server-icon.png','bytes':icon.stat().st_size,'kind':'icon'})
+    return result
+
+def read_config(server_id,rel):
+    path=config_path(server_id,rel)
+    if not path.is_file():raise ValueError('Config file does not exist')
+    if path.stat().st_size>1024*1024:raise ValueError('Config file too large')
+    content=path.read_text(encoding='utf-8')
+    if rel=='server.properties':
+        content=re.sub(r'(?m)^(rcon\.password[ \t]*=).*$',lambda m:m.group(1)+'[PROTECTED]',content)
+    return content
+
+def _prop_map(raw):
+    values={}
+    for line in raw.splitlines():
+        if not line.strip() or line.lstrip().startswith(('#','!')) or '=' not in line:
+            continue
+        k,v=line.split('=',1)
+        k=k.strip()
+        if k in values:
+            raise ValueError('Duplicate server.properties key: '+k)
+        values[k]=v.strip()
+    return values
+
+# Only documented, vanilla-compatible commands. Other keys need a server restart.
+_LIVE_PROPERTIES = {
+    'difficulty': lambda v: 'difficulty '+v if v in ('peaceful','easy','normal','hard') else None,
+    'gamemode': lambda v: 'defaultgamemode '+v if v in ('survival','creative','adventure','spectator') else None,
+    'white-list': lambda v: 'whitelist '+('on' if v=='true' else 'off') if v in ('true','false') else None,
+}
+
+def save_config(server_id,rel,raw):
+    running=state(service_name(server_id))
+    if rel!='server.properties':
+        ensure_stopped(server_id)
+    elif running not in ('active','inactive'):
+        raise RuntimeError('Wait until the server finishes changing state before saving')
+    elif state('minecraft-backup.service') in ('active','activating','deactivating'):
+        raise RuntimeError('Cannot change configuration during Minecraft backup')
+    p=config_path(server_id,rel)
+    if not p.is_file():raise ValueError('Only existing configuration files can be edited')
+    if p.stat().st_size>1024*1024 or len(raw.encode('utf-8'))>1024*1024:
+        raise ValueError('Config too large')
+    if rel=='server.properties':
+        old=p.read_text(encoding='utf-8')
+        prior_values=_prop_map(old)
+        new_values=_prop_map(raw)
+        changed={k for k in set(prior_values)|set(new_values) if prior_values.get(k)!=new_values.get(k)}
+        old_password=re.findall(r'(?m)^rcon\.password[ \t]*=(.*)$',old)
+        new_password=re.findall(r'(?m)^rcon\.password[ \t]*=(.*)$',raw)
+        if len(old_password)!=len(new_password) or (old_password and (len(old_password)!=1 or new_password[0]!='[PROTECTED]')):
+            raise ValueError('Keep rcon.password=[PROTECTED] unchanged. Use the RCON manager for password changes.')
+        raw=re.sub(r'(?m)^(rcon\.password[ \t]*=)\[PROTECTED\]$',lambda m:m.group(1)+old_password[0],raw)
+        for key in ('rcon.port','enable-rcon','server-port','server-ip'):
+            old_setting=re.findall(r'(?m)^'+re.escape(key)+r'[ \t]*=(.*)$',old)
+            new_setting=re.findall(r'(?m)^'+re.escape(key)+r'[ \t]*=(.*)$',raw)
+            if old_setting!=new_setting:
+                raise ValueError(key+' is managed by the server manager and cannot be changed here')
+    parent=p.parent
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w',dir=parent,prefix='.cockpit-edit-',delete=False,encoding='utf-8') as tmp:
+        name=tmp.name;tmp.write(raw)
+    try:
+        os.chmod(name,p.stat().st_mode & 0o777)
+        shutil.chown(name,user='minecraft',group='minecraft')
+        # Keep a local backup of the previous config in the same directory.
+        backup=p.with_name(p.name+'.cockpit-backup')
+        if backup.is_symlink():raise ValueError('Untrusted backup path')
+        shutil.copy2(p,backup)
+        os.replace(name,p)
+    finally:
+        if os.path.exists(name):os.unlink(name)
+    if rel!='server.properties':
+        return 'Saved '+rel+'; restart this server to apply changes.'
+    if not changed:
+        return 'Saved server.properties (no setting values changed).'
+    if running!='active':
+        return 'Saved server.properties. Changes will apply on the next server start.'
+    applied=[];pending=[];failed=[]
+    for key in sorted(changed):
+        build=_LIVE_PROPERTIES.get(key)
+        cmd=build(new_values[key]) if build and key in new_values else None
+        if cmd:
+            try:
+                response=rcon_command(server_id,cmd)
+                # rconclt exits successfully for many in-game command failures;
+                # expose response without falsely claiming successful application.
+                if re.search(r'(?i)(unknown command|incorrect argument|failed|error|no permission)',response):
+                    failed.append(key+': '+response[:160])
+                else:
+                    applied.append(key+' ('+response.strip()[:100]+')')
+            except Exception as exc:
+                failed.append(key+': '+str(exc)[:130])
+        else:
+            pending.append(key)
+    bits=['Saved server.properties while running.']
+    if applied:bits.append('Live command sent: '+', '.join(applied)+'.')
+    if pending:bits.append('Restart required for: '+', '.join(pending)+'.')
+    if failed:bits.append('Live apply could not be confirmed (saved on disk; restart required): '+', '.join(failed)+'.')
+    return ' '.join(bits)
+
+def branding_icon_status(server_id):
+    dest=secure_path(file_root(server_id),'server-icon.png')
+    return {'path':str(dest),'exists':dest.is_file(),'bytes':dest.stat().st_size if dest.is_file() else 0}
+
+def branding_icon_upload(server_id):
+    # Read and verify before touching the destination. Keep backup and atomic replacement.
+    ensure_stopped(server_id)
+    dest=secure_path(file_root(server_id),'server-icon.png')
+    data=sys.stdin.buffer.read(2*1024*1024+1)
+    if len(data)<24 or len(data)>2*1024*1024:raise ValueError('PNG must be between 24 bytes and 2 MB')
+    if data[:8]!=bytes.fromhex('89504e470d0a1a0a') or data[12:16]!=b'IHDR' or int.from_bytes(data[16:20],'big')!=64 or int.from_bytes(data[20:24],'big')!=64:
+        raise ValueError('Icon must be a 64×64 PNG')
+    import tempfile
+    fd,temporary=tempfile.mkstemp(prefix='.brand-icon-',dir=str(dest.parent))
+    try:
+        with os.fdopen(fd,'wb') as f:f.write(data);f.flush();os.fsync(f.fileno())
+        os.chmod(temporary,0o640)
+        shutil.chown(temporary,user='minecraft',group='minecraft')
+        # Save existing icon first; no deletion of the prior image.
+        if dest.exists():
+            backup=dest.with_name('server-icon.png.cockpit-backup-'+str(int(time.time())))
+            if backup.exists():raise ValueError('Backup collision: retry upload')
+            shutil.copy2(dest,backup,follow_symlinks=False)
+        ensure_stopped(server_id)
+        os.replace(temporary,dest)
+    finally:
+        if os.path.exists(temporary):os.unlink(temporary)
+    return {'path':str(dest),'bytes':len(data),'restart_required':True}
+
+def upload_file(server_id,category,filename):
+    ensure_stopped(server_id)
+    if category not in ('mods','plugins','resourcepacks','icon'):
+        raise ValueError('Unsupported upload category')
+    kind= 'neoforge' if server_id=='neoforge' else registry()[server_id].get('type')
+    if category=='mods' and kind!='neoforge':raise ValueError('Mods upload is for NeoForge only')
+    if category=='plugins' and kind!='spigot':raise ValueError('Plugins upload is for Spigot only')
+    if filename in ('.','..') or '/' in filename or '\\' in filename or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9._+() -]{0,155}',filename):
+        raise ValueError('Invalid file name')
+    ext=pathlib.Path(filename).suffix.lower()
+    if category in ('mods','plugins') and ext!='.jar':raise ValueError('Expected .jar file')
+    if category=='resourcepacks' and ext!='.zip':raise ValueError('Expected .zip resource pack')
+    if category=='icon' and ext!='.png':raise ValueError('Expected 64x64 PNG')
+    max_size=2*1024*1024 if category=='icon' else 300*1024*1024
+    root=file_root(server_id)
+    rel='server-icon.png' if category=='icon' else category+'/'+filename
+    dest=secure_path(root,rel)
+    if dest.exists():raise ValueError('File already exists: '+rel+' (remove or rename it manually first)')
+    if category!='icon':
+        parent=dest.parent
+        if parent.exists() and parent.is_symlink():raise ValueError('Untrusted upload directory')
+        parent.mkdir(mode=0o750,exist_ok=True)
+        shutil.chown(parent,user='minecraft',group='minecraft')
+    import tempfile
+    with tempfile.NamedTemporaryFile(dir=dest.parent,prefix='.mc-upload-',delete=False) as tmp:
+        temp=pathlib.Path(tmp.name)
+    try:
+        total=0
+        with temp.open('wb') as tmp:
+            while True:
+                chunk=sys.stdin.buffer.read(1024*1024)
+                if not chunk:break
+                total+=len(chunk)
+                if total>max_size:raise ValueError('Upload exceeds size limit')
+                tmp.write(chunk)
+        if total==0:raise ValueError('Empty upload')
+        if category=='icon':
+            with temp.open('rb') as stream:
+                head=stream.read(24)
+            if len(head)<24 or head[:8]!=bytes.fromhex('89504e470d0a1a0a') or head[12:16]!=b'IHDR' or int.from_bytes(head[16:20],'big')!=64 or int.from_bytes(head[20:24],'big')!=64:
+                raise ValueError('Minecraft icon must be a valid-looking 64x64 PNG')
+        os.chmod(temp,0o640)
+        shutil.chown(temp,user='minecraft',group='minecraft')
+        os.link(temp,dest,follow_symlinks=False)  # Atomic create-only; no overwritten mod or world.
+    finally:
+        temp.unlink(missing_ok=True)
+    return 'Uploaded '+rel+' ('+str(total)+' bytes). Restart the server when ready.'
+
+
+# Server-aware controls. These commands never accept arbitrary paths or shell strings.
+SETTINGS = {
+    'white-list': ('bool', None), 'enforce-whitelist': ('bool', None),
+    'difficulty': ('enum', ('peaceful','easy','normal','hard')),
+    'gamemode': ('enum', ('survival','creative','adventure','spectator')),
+    'hardcore': ('bool', None), 'pvp': ('bool', None),
+    'max-players': ('int', (1, 200)), 'view-distance': ('int', (2, 32)),
+    'simulation-distance': ('int', (2, 32)),
+    'motd': ('text', 120), 'spawn-protection': ('int', (0, 128)),
+}
+
+def properties_dict(server_id):
+    f=secure_path(file_root(server_id),'server.properties')
+    data={}
+    for line in f.read_text(encoding='utf-8').splitlines():
+        if '=' in line and not line.lstrip().startswith('#'):
+            k,v=line.split('=',1)
+            if k in SETTINGS:data[k]=v
+    return data
+
+def save_settings(server_id, settings):
+    if not isinstance(settings,dict) or not settings or len(settings)>len(SETTINGS):
+        raise ValueError('Invalid settings')
+    for k,v in settings.items():
+        if k not in SETTINGS or not isinstance(v,str):raise ValueError('Unsupported setting')
+        typ,limit=SETTINGS[k]
+        if typ=='bool' and v not in ('true','false'):raise ValueError('Invalid '+k)
+        if typ=='enum' and v not in limit:raise ValueError('Invalid '+k)
+        if typ=='int' and (not v.isdigit() or not limit[0]<=int(v)<=limit[1]):raise ValueError('Invalid '+k)
+        if typ=='text' and (len(v)>limit or '\n' in v or '\r' in v):raise ValueError('Invalid '+k)
+    original=read_config(server_id,'server.properties')
+    out=[];seen=set()
+    for line in original.splitlines():
+        key=line.split('=',1)[0] if '=' in line else ''
+        if key in settings:
+            if key in seen:raise ValueError('Duplicate server.properties setting: '+key)
+            out.append(key+'='+settings[key]);seen.add(key)
+        else:out.append(line)
+    for k in settings:
+        if k not in seen:out.append(k+'='+settings[k])
+    return save_config(server_id,'server.properties','\n'.join(out)+'\n')
+
+def player_action(server_id,operation,username=None):
+    if operation=='list':return rcon_command(server_id,'list')
+    if operation=='whitelist-list':return rcon_command(server_id,'whitelist list')
+    if operation=='whitelist-on':return rcon_command(server_id,'whitelist on')
+    if operation=='whitelist-off':return rcon_command(server_id,'whitelist off')
+    if operation not in ('whitelist-add','whitelist-remove','op','deop','kick','ban','pardon'):
+        raise ValueError('Unknown player operation')
+    if not username or not re.fullmatch(r'[A-Za-z0-9_]{3,16}',username):
+        raise ValueError('Enter a Minecraft Java username (3–16 letters, digits or underscores)')
+    cmds={'whitelist-add':'whitelist add','whitelist-remove':'whitelist remove',
+          'op':'op','deop':'deop','kick':'kick','ban':'ban','pardon':'pardon'}
+    return rcon_command(server_id,cmds[operation]+' '+username)
+
+def stats_server(server_id):
+    srv=info(server_id);unit=srv['unit'];status=state(unit)
+    values=run(['systemctl','show',unit,'--property=MemoryCurrent,CPUUsageNSec,ActiveEnterTimestampMonotonic,MainPID'],check=False)
+    raw=dict(line.split('=',1) for line in values.splitlines() if '=' in line)
+    root=file_root(server_id)
+    usage=shutil.disk_usage(root)
+    result={'state':status,'memory_bytes':int(raw.get('MemoryCurrent','0')) if raw.get('MemoryCurrent','').isdigit() else None,
+            'cpu_seconds':round(int(raw.get('CPUUsageNSec','0'))/1e9,1) if raw.get('CPUUsageNSec','').isdigit() else None,
+            'pid':raw.get('MainPID'),'disk_free_bytes':usage.free,'disk_total_bytes':usage.total,
+            'uptime_seconds':None,'players':None,'tps':None}
+    if status=='active':
+        try:
+            monotonic=int(raw.get('ActiveEnterTimestampMonotonic','0'))
+            if monotonic:result['uptime_seconds']=max(0,round(time.clock_gettime(time.CLOCK_MONOTONIC)-monotonic/1e6))
+        except (ValueError,OSError):pass
+        if rcon_ready(server_id):
+            try:result['players']=player_action(server_id,'list')
+            except Exception:pass
+        # TPS/MSPT vary by implementation: never invent values for Vanilla.
+    return result
+
+
+def server_insights(server_id):
+    """Bounded read-only world, JVM and health inventory; no file contents or secrets."""
+    srv=info(server_id)
+    root=file_root(server_id)
+    unit=srv['unit']
+    status=state(unit)
+    def tree_size(directory, max_entries=12000):
+        if not directory.is_dir() or directory.is_symlink():
+            return {'bytes':0,'files':0,'truncated':False}
+        total=0;count=0;truncated=False
+        stack=[directory]
+        while stack:
+            folder=stack.pop()
+            try:
+                with os.scandir(folder) as it:
+                    for ent in it:
+                        if ent.is_symlink():continue
+                        count+=1
+                        if count>max_entries:
+                            truncated=True;stack.clear();break
+                        try:
+                            if ent.is_dir(follow_symlinks=False):stack.append(pathlib.Path(ent.path))
+                            elif ent.is_file(follow_symlinks=False):total+=ent.stat(follow_symlinks=False).st_size
+                        except (OSError,PermissionError):pass
+            except (OSError,PermissionError):pass
+        return {'bytes':total,'files':min(count,max_entries),'truncated':truncated}
+    worlds=[]
+    try:
+        # Use level-name from server.properties without exposing unrelated properties.
+        props=root/'server.properties'
+        level='world'
+        if props.is_file():
+            for line in props.read_text(errors='replace').splitlines():
+                if line.startswith('level-name='):
+                    candidate=line.partition('=')[2].strip()
+                    if re.fullmatch(r'[A-Za-z0-9_ .-]{1,80}',candidate) and candidate not in ('.','..'):
+                        level=candidate
+                    break
+        for name in (level,level+'_nether',level+'_the_end','DIM-1','DIM1'):
+            if name in [v['name'] for v in worlds]:continue
+            path=root/name
+            if path.is_dir() and not path.is_symlink():
+                worlds.append({'name':name,**tree_size(path)})
+    except (OSError,PermissionError):pass
+    show=run(['systemctl','show',unit,'--property=ExecStart,MemoryMax,CPUQuotaPerSecUSec,AllowedCPUs,TasksCurrent,TasksMax,Restart,RestartUSec,NRestarts,MainPID'],check=False,timeout=10)
+    props=dict(line.split('=',1) for line in show.splitlines() if '=' in line)
+    # Avoid returning ExecStart: it may contain secrets or credentials.
+    pid=props.get('MainPID','0')
+    java={'pid':pid,'heap_min':None,'heap_max':None,'gc':None}
+    if pid.isdigit() and int(pid)>1:
+        try:
+            raw=(pathlib.Path('/proc')/pid/'cmdline').read_bytes().split(b'\\0')
+            for arg in raw:
+                value=arg.decode('utf-8','replace')
+                if re.fullmatch(r'-Xm[sx][0-9]+[kKmMgG]?',value):
+                    java['heap_min' if value.startswith('-Xms') else 'heap_max']=value
+                elif re.fullmatch(r'-XX:\\+Use(?:G1|Z|Shenandoah|Parallel|Serial)GC',value):
+                    java['gc']=value.replace('-XX:+Use','').replace('GC','')
+        except (OSError,PermissionError):pass
+    notices=[]
+    if status!='active':notices.append('Server is not running; live JVM information may be unavailable.')
+    if not worlds:notices.append('No world directories detected; check the server directory and level-name.')
+    if any(w['truncated'] for w in worlds):notices.append('World size scan reached the 12,000-entry safety limit; reported sizes are partial.')
+    try:
+        free=shutil.disk_usage(root).free
+        if free<5*1024**3:notices.append('Less than 5 GiB free on the server filesystem.')
+    except OSError:pass
+    return {'server':server_id,'state':status,'worlds':worlds,'java':java,
+            'limits':{k:props.get(k,'') for k in ('MemoryMax','CPUQuotaPerSecUSec','AllowedCPUs','TasksCurrent','TasksMax','Restart','NRestarts')},
+            'notices':notices}
+
+def addon_catalog(server_id):
+    root=file_root(server_id)
+    folder='mods' if server_id=='neoforge' else ('plugins' if registry()[server_id].get('type')=='spigot' else None)
+    if not folder:return []
+    d=secure_path(root,folder)
+    if not d.is_dir():return []
+    return [{'name':f.name,'enabled':f.suffix.lower()=='.jar','bytes':f.stat().st_size}
+            for f in sorted(d.iterdir()) if f.is_file() and not f.is_symlink() and
+            (f.name.lower().endswith('.jar') or f.name.lower().endswith('.jar.disabled'))][:300]
+
+def toggle_addon(server_id,filename,enable):
+    ensure_stopped(server_id)
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+() -]{0,155}\.jar(?:\.disabled)?',filename):
+        raise ValueError('Invalid add-on name')
+    folder='mods' if server_id=='neoforge' else ('plugins' if registry()[server_id].get('type')=='spigot' else None)
+    if not folder:raise ValueError('This server does not support mod/plugin JARs')
+    src=secure_path(file_root(server_id),folder+'/'+filename)
+    if not src.is_file() or src.is_symlink():raise ValueError('Add-on not found')
+    if enable and not filename.endswith('.jar.disabled'):raise ValueError('Already enabled')
+    if not enable and not filename.endswith('.jar'):raise ValueError('Already disabled')
+    dest=secure_path(file_root(server_id),folder+'/'+(filename[:-9] if enable else filename+'.disabled'))
+    if dest.exists():raise ValueError('Destination already exists')
+    src.rename(dest)
+    return 'Enabled' if enable else 'Disabled'
+
+def snapshot_objects(server_id):
+    service_name(server_id);repo=repo_for(server_id)
+    tag='minecraft-manual' if server_id=='neoforge' else 'mc-server-'+server_id
+    raw=run(['restic','--repo',repo,'--password-file',KEY,'snapshots','--json','--tag',tag],timeout=90)
+    expected=str(file_root(server_id))
+    return [{'id':snap['id'],'time':snap.get('time'),'tags':snap.get('tags',[])}
+            for snap in json.loads(raw) if expected in snap.get('paths',[]) and
+            tag in snap.get('tags',[]) and isinstance(snap.get('id'),str)]
+
+def restore_snapshot(server_id,snapshot_id,ack):
+    if ack!='RESTORE '+server_id:raise ValueError('Explicit restore confirmation missing')
+    if not re.fullmatch(r'[a-f0-9]{64}',snapshot_id):raise ValueError('Invalid snapshot ID')
+    with pathlib.Path('/run/lock/cockpit-minecraft-switch.lock').open('a+') as lock:
+        fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+        ensure_stopped(server_id)
+        repo=repo_for(server_id)
+        if snapshot_id not in {s['id'] for s in snapshot_objects(server_id)}:
+            raise ValueError('Snapshot is not verified for this server')
+        root=file_root(server_id)
+        if root.is_symlink():raise ValueError('Unsafe server root')
+        import tempfile
+        # A temporary directory on the SAME filesystem enables safe rename/swap.
+        with tempfile.TemporaryDirectory(prefix='.mc-restore-',dir=str(root.parent)) as temp:
+            stage=pathlib.Path(temp)
+            cmd=['restic','--repo',repo,'--password-file',KEY,'restore',snapshot_id,'--target',str(stage)]
+            run(cmd,timeout=1800)
+            restored=stage/root.relative_to('/')
+            if not restored.is_dir() or not (restored/'server.properties').is_file():
+                raise RuntimeError('Restored snapshot is missing its server directory or server.properties')
+            # Recovery snapshot of the current stopped server BEFORE changing any files.
+            run(['restic','--repo',repo,'--password-file',KEY,'backup',str(root),
+                 '--tag','mc-pre-restore','--tag','mc-server-'+server_id],timeout=1800)
+            old=root.parent/(root.name+'.pre-restore-'+snapshot_id[:12])
+            if old.exists():raise RuntimeError('Recovery folder already exists; manual review required')
+            root.rename(old)
+            try:restored.rename(root)
+            except Exception:
+                old.rename(root)
+                raise
+            return 'Restored '+server_id+' from '+snapshot_id[:12]+'. Previous files are retained at '+str(old)+'. Server remains stopped; verify before starting.'
+
+
+# Read-only bounded operational history, with no persistent monitoring daemon.
+def operational_history(server_id):
+    unit=service_name(server_id)
+    # Journal is queried by unit name, not an arbitrary user-supplied path.
+    raw=run(['journalctl','-u',unit,'--since','24 hours ago','-n','700',
+             '--no-pager','--output=short-iso'],timeout=15,check=False)
+    events=[]
+    patterns=[('joined',re.compile(r'\b([A-Za-z0-9_]{3,16}) joined the game\b')),
+              ('left',re.compile(r'\b([A-Za-z0-9_]{3,16}) left the game\b')),
+              ('warning',re.compile(r'(?i)(can.t keep up|outofmemoryerror|watchdog|server overloaded|exception in server tick loop)'))]
+    for line in raw.splitlines():
+        for kind,pattern in patterns:
+            m=pattern.search(line)
+            if m:
+                # Return only timestamp and allowlisted event text; avoid leaking chat, IPs or tokens.
+                stamp=line[:25].strip()
+                events.append({'time':stamp,'type':kind,'detail':m.group(1) if kind!='warning' else 'Performance/crash warning'})
+                break
+    values=run(['systemctl','show',unit,'--property=NRestarts,Result,ExecMainStatus,ActiveState,SubState'],check=False,timeout=10)
+    state_map=dict(v.split('=',1) for v in values.splitlines() if '=' in v)
+    return {'server':server_id,'events':events[-100:],
+            'summary':{k:state_map.get(k,'') for k in ('NRestarts','Result','ExecMainStatus','ActiveState','SubState')},
+            'scope':'Last 24 hours, maximum 700 journal lines; journal retention may be shorter.'}
+
+def resource_policy(server_id):
+    unit=service_name(server_id)
+    raw=run(['systemctl','show',unit,'--property=CPUQuotaPerSecUSec,MemoryHigh,MemoryMax,AllowedCPUs,Restart,NRestarts,MainPID'],check=False,timeout=10)
+    values=dict(v.split('=',1) for v in raw.splitlines() if '=' in v)
+    values.pop('MainPID',None)
+    values['unit']=unit
+    values['note']='CPU quota and memory limits are systemd controls, not Java heap settings. A quota can reduce TPS. No settings are changed by viewing this panel.'
+    return values
+
+def apply_cpu_quota(server_id,percent):
+    # Explicitly limited to managed servers; do not touch legacy NeoForge or other system units.
+    if server_id=='neoforge':raise ValueError('CPU quota editing is disabled for legacy NeoForge')
+    unit=service_name(server_id)
+    if percent not in ('off','100','200','300','400','600','800'):
+        raise ValueError('Choose one of the supported CPU quota presets')
+    if state(unit)!='active':raise ValueError('Start the selected managed server before applying a runtime quota')
+    setting='infinity' if percent=='off' else percent+'%'
+    # Runtime only: no persistent unit modification and no service restart.
+    run(['systemctl','set-property','--runtime',unit,'CPUQuota='+setting],timeout=20)
+    return {'applied':setting,'mode':'runtime only (clears after reboot)','unit':unit}
+
+
+# v5: safe, read-only operational overview. No service configuration is modified.
+def control_center(server_id):
+    unit=service_name(server_id)
+    root=file_root(server_id)
+    props=resource_policy(server_id)
+    history=operational_history(server_id)
+    insights=server_insights(server_id)
+    stats=stats_server(server_id)
+    # Backup availability is intentionally reported without opening Restic secrets.
+    repository=pathlib.Path(REPO)
+    repo_ready=repository.is_dir() and (repository/'config').is_file()
+    free=None
+    try:free=shutil.disk_usage(root).free
+    except OSError:pass
+    return {'server':server_id,'service':unit,'state':state(unit),
+        'policy':props,'history':history,'insights':insights,'stats':stats,
+        'backup':{'repository_detected':repo_ready,'repository_path':REPO,
+                  'note':'Repository presence is not a backup integrity verification. Use the existing Backups tab for snapshots.'},
+        'disk_free_bytes':free,
+        'restart_policy':props.get('Restart','unknown'),
+        'recommendations':[
+          'JVM heap changes require verifying the actual launcher and startup flags; no automatic edits are performed.',
+          'Avoid setting a CPU quota unless you have measured contention: it can worsen TPS.',
+          'A restart policy without start-rate limits can create crash loops; inspect the systemd unit before changing it.',
+          'Stop the server and take a verified backup before editing world or startup files.'
+        ]}
+
+def resource_plan(server_id,min_gib,max_gib,cores):
+    # Validate a proposed plan only; do not persist or execute it.
+    if not (min_gib.isdigit() and max_gib.isdigit() and cores.isdigit()):
+        raise ValueError('RAM and core values must be whole numbers')
+    mn,mx,cp=map(int,(min_gib,max_gib,cores))
+    if not (1<=mn<=mx<=64 and 1<=cp<=32):
+        raise ValueError('Require 1 <= minimum RAM <= maximum RAM <= 64 GiB, and 1-32 logical CPUs')
+    total_kib=0
+    try:
+        for line in pathlib.Path('/proc/meminfo').read_text().splitlines():
+            if line.startswith('MemTotal:'):
+                total_kib=int(line.split()[1]);break
+    except OSError:pass
+    total_gib=round(total_kib/1048576,2) if total_kib else None
+    warnings=[]
+    if total_gib and mx>total_gib*0.7:warnings.append('Maximum heap exceeds 70% of total physical RAM; leave headroom for OS, native JVM memory and other services.')
+    if cp<4:warnings.append('Restricting CPU time may worsen tick lag; this is a proposed quota, not CPU affinity.')
+    return {'server':server_id,'minimum_heap':'-Xms'+str(mn)+'G',
+            'maximum_heap':'-Xmx'+str(mx)+'G','proposed_cpu_quota':str(cp*100)+'%',
+            'physical_ram_gib':total_gib,'warnings':warnings,
+            'status':'Preview only. No file, systemd unit, JVM flag or server was changed.',
+            'next_step':'Confirm the server launcher and existing heap flags before implementing persistent changes.'}
+
+
+# v6: scoped, reversible configuration management for the existing NeoForge instance.
+def v6_heap_path():
+    unit=run(['systemctl','show','minecraft-26.service','--property=WorkingDirectory','--value'],check=False).strip()
+    root=pathlib.Path(unit) if unit.startswith('/') else MINECRAFT
+    if root.resolve()!=MINECRAFT.resolve():
+        raise ValueError('Unexpected NeoForge working directory; refusing to edit JVM settings')
+    path=root/'user_jvm_args.txt'
+    if not path.is_file() or path.is_symlink():raise ValueError('NeoForge JVM argument file missing or symbolic link')
+    return path
+
+def v6_heap_read():
+    path=v6_heap_path();content=path.read_text()
+    pairs=re.findall(r'(?m)^\s*-Xm([sx])\s*(\d+)([gGmM])(?=\s|$)',content)
+    values={}
+    for kind,num,unit in pairs:
+        if kind in values:raise ValueError('Duplicate JVM heap setting; manual review required')
+        values[kind]=int(num) if unit.lower()=='g' else int(num)/1024
+    if set(values)!={'s','x'}:raise ValueError('Expected one -Xms and one -Xmx setting')
+    return {'minimum_gib':values['s'],'maximum_gib':values['x'],'file':str(path),'server_state':state('minecraft-26.service')}
+
+def v6_heap_save(minimum,maximum):
+    from decimal import Decimal,InvalidOperation
+    try:
+        mn=Decimal(minimum);mx=Decimal(maximum)
+    except InvalidOperation:raise ValueError('Heap values must be whole GiB')
+    if mn!=int(mn) or mx!=int(mx) or not 1<=mn<=mx<=24:raise ValueError('Choose whole GiB values: 1 <= minimum <= maximum <= 24')
+    if state('minecraft-26.service')!='inactive':raise ValueError('Stop NeoForge before editing JVM heap')
+    path=v6_heap_path();old=path.read_text();v6_heap_read()
+    total=0
+    for line in pathlib.Path('/proc/meminfo').read_text().splitlines():
+        if line.startswith('MemTotal:'):total=int(line.split()[1])/1048576;break
+    if not total or float(mx)>total*0.7:raise ValueError('Maximum heap must be at most 70% of physical RAM')
+    new,n1=re.subn(r'(?m)^(\s*-Xms)\s*\d+[gGmM](?=\s|$)',lambda m:m.group(1)+str(int(mn))+'G',old)
+    new,n2=re.subn(r'(?m)^(\s*-Xmx)\s*\d+[gGmM](?=\s|$)',lambda m:m.group(1)+str(int(mx))+'G',new)
+    if n1!=1 or n2!=1:raise ValueError('Cannot safely identify heap flags')
+    import tempfile
+    backup_dir=pathlib.Path('/var/backups/cockpit-minecraft-manager/v6-jvm');backup_dir.mkdir(parents=True,exist_ok=True)
+    stamp=time.strftime('%Y%m%dT%H%M%SZ',time.gmtime())+'-'+str(time.time_ns())
+    backup=backup_dir/('user_jvm_args-'+stamp+'.txt')
+    shutil.copy2(path,backup)
+    fd,tmp=tempfile.mkstemp(prefix='.jvm-v6-',dir=path.parent)
+    try:
+        os.fchmod(fd,path.stat().st_mode & 0o777)
+        with os.fdopen(fd,'w') as f:
+            f.write(new);f.flush();os.fsync(f.fileno())
+        os.chown(tmp,path.stat().st_uid,path.stat().st_gid)
+        if state('minecraft-26.service')!='inactive':raise ValueError('Server started during edit; no changes applied')
+        os.replace(tmp,path)
+    finally:
+        if os.path.exists(tmp):os.unlink(tmp)
+    return {'saved':True,'minimum_gib':int(mn),'maximum_gib':int(mx),'backup':str(backup),'note':'Settings apply on next server start; server was not started'}
+
+def v6_recovery_read():
+    unit='minecraft-26.service'
+    fields=['Restart','RestartUSec','StartLimitBurst','StartLimitIntervalUSec']
+    values={}
+    for field in fields:
+        values[field]=run(['systemctl','show',unit,'--property='+field,'--value'],check=False)
+    return {'unit':unit,'settings':values,'state':state(unit),'note':'Read-only. Existing on-failure policy is unchanged.'}
+
+def v6_recovery_save(delay,burst,interval):
+    if state('minecraft-26.service')!='inactive':raise ValueError('Stop NeoForge before editing crash recovery')
+    try:d=int(delay);b=int(burst);i=int(interval)
+    except ValueError:raise ValueError('Use integer recovery settings')
+    if str(d)!=delay or str(b)!=burst or str(i)!=interval or not (5<=d<=300 and 1<=b<=10 and 60<=i<=3600):
+        raise ValueError('Delay 5-300 seconds; burst 1-10; interval 60-3600 seconds')
+    directory=pathlib.Path('/etc/systemd/system/minecraft-26.service.d')
+    target=directory/'90-cockpit-v6-recovery.conf'
+    backup_dir=pathlib.Path('/var/backups/cockpit-minecraft-manager/v6-recovery');backup_dir.mkdir(parents=True,exist_ok=True)
+    directory.mkdir(parents=True,exist_ok=True)
+    backup=None
+    if target.exists():
+        backup=backup_dir/('recovery-'+str(time.time_ns())+'.conf');shutil.copy2(target,backup)
+    content='[Unit]\nStartLimitIntervalSec='+str(i)+'\nStartLimitBurst='+str(b)+'\n\n[Service]\nRestart=on-failure\nRestartSec='+str(d)+'\n'
+    import tempfile
+    fd,tmp=tempfile.mkstemp(prefix='.recovery-v6-',dir=directory)
+    try:
+        with os.fdopen(fd,'w') as f:f.write(content);f.flush();os.fsync(f.fileno())
+        os.chmod(tmp,0o644)
+        if state('minecraft-26.service')!='inactive':raise ValueError('Server started during edit; no changes applied')
+        os.replace(tmp,target)
+        try:run(['systemctl','daemon-reload'],timeout=30)
+        except Exception:
+            if backup:shutil.copy2(backup,target)
+            else:target.unlink(missing_ok=True)
+            run(['systemctl','daemon-reload'],timeout=30,check=False)
+            raise
+    finally:
+        if os.path.exists(tmp):os.unlink(tmp)
+    return {'saved':True,'file':str(target),'previous_override_backup':str(backup) if backup else None,'note':'No server start or restart was performed'}
+
+
+# v7: bounded read-only performance history. The collector runs independently via systemd timer.
+def v7_metrics(server_id, hours):
+    import sqlite3
+    unit=service_name(server_id)
+    if hours not in ('1','6','24','168'):raise ValueError('Unsupported history window')
+    db=pathlib.Path('/var/lib/cockpit-minecraft-metrics/history.sqlite3')
+    if not db.exists():return {'samples':[],'retention_days':7,'interval_seconds':60,'message':'No samples yet. Check the collector timer.'}
+    con=sqlite3.connect('file:'+str(db)+'?mode=ro',uri=True,timeout=5)
+    try:
+        rows=con.execute('SELECT ts,active,memory_bytes,cpu_usec FROM samples WHERE unit=? AND ts>=? ORDER BY ts',(unit,int(time.time())-int(hours)*3600)).fetchall()
+    finally:con.close()
+    # Downsample server-side to at most ~420 points; compute CPU using original adjacent samples.
+    out=[];previous=None
+    for ts,active,mem,cpu in rows:
+        percent=None
+        if previous and active and previous[1] and cpu is not None and previous[2] is not None and ts>previous[0] and cpu>=previous[2]:
+            percent=round((cpu-previous[2])/(ts-previous[0])/10000,2)
+        previous=(ts,active,cpu)
+        out.append({'ts':ts,'active':bool(active),'memory_gib':round(mem/1073741824,3) if mem is not None else None,'cpu_percent':percent})
+    stride=max(1,(len(out)+419)//420)
+    return {'samples':out[::stride] if stride==1 else out[::stride]+([out[-1]] if out[-1] is not out[::stride][-1] else []),'retention_days':7,'interval_seconds':60,'cpu_note':'100% equals one logical CPU; usage can exceed 100%','message':None}
+
+# Read-only player activity feed. Never triggers RCON connections.
+_ACTIVITY_RULES = (
+    ('join', re.compile(r'\b(?:joined the game|logged in with entity id)\b', re.I)),
+    ('leave', re.compile(r'\b(?:left the game|lost connection|disconnected:|timed out)\b', re.I)),
+    ('chat', re.compile(r'(?:\b(?:Async Chat Thread|Chat Thread)\b|\[Server thread/INFO\].*?: <[^>]+>|\bchat: <[^>]+>)', re.I)),
+    ('announcement', re.compile(r'\b(?:System chat:|advancement|completed the challenge|reached the goal|made the advancement|was slain|was blown up|fell from|drowned|burned to death|hit the ground too hard|was shot by|was killed by|issued server command:|\[Not Secure\])\b', re.I)),
+    ('command', re.compile(r'\b(?:issued server command:|issued command:|executed command:|ran command:|issued server command)\b', re.I)),
+    ('moderation', re.compile(r'\b(?:kicked|banned|unbanned|whitelist|made .* a server operator|opped|de-opped)\b', re.I)),
+)
+
+def player_activity(server_id):
+    unit = service_name(server_id)  # validated server ID; never arbitrary journal units
+    raw = run(['journalctl','-u',unit,'--since','24 hours ago','-n','2500',
+               '--no-pager','--output=short-iso'],timeout=20,check=False)
+    events=[]
+    for line in raw.splitlines():
+        # Skip non-Minecraft infrastructure messages, including RCON socket noise.
+        if not ('java[' in line or 'minecraft[' in line):
+            continue
+        if re.search(r'RCON|User Authenticator',line,re.I):
+            continue
+        kind=None
+        for category,pattern in _ACTIVITY_RULES:
+            if pattern.search(line):
+                kind=category
+                break
+        if kind:
+            events.append({'type':kind,'text':line[:1800]})
+    return {'events':events[-500:],'scope':'Last 24 hours (up to 2,500 recent journal lines). Some events may be unavailable after log rotation.',
+            'note':'Only events recorded by the Minecraft server can appear here. Vanilla does not reliably log every player command.'}
+
+def schedule_bridge(action, server_id, payload=None):
+    # Scheduler has a separate root-only on-disk state and its own timer.
+    service_name(server_id)  # validate against the existing manager registry
+    cmd=['/usr/local/libexec/cockpit-minecraft-announcements',action,server_id]
+    result=subprocess.run(cmd,input=payload,text=True,capture_output=True,timeout=18)
+    if result.returncode:
+        raise RuntimeError((result.stderr or result.stdout).strip()[:800])
+    return json.loads(result.stdout)
+
+def main(args):
+    if not args:raise ValueError('Missing operation')
+    op,*a=args
+    if op=='v7-metrics' and len(a)==2:return v7_metrics(*a)
+    if op=='v6-heap-read' and len(a)==0:return v6_heap_read()
+    if op=='v6-heap-save' and len(a)==2:return v6_heap_save(*a)
+    if op=='v6-recovery-read' and len(a)==0:return v6_recovery_read()
+    if op=='v6-recovery-save' and len(a)==3:return v6_recovery_save(*a)
+    if op=='create-with-backup' and len(a)==9:return create_with_backup(*a)
+    if op=='backup-settings' and len(a)==1:return backup_settings_for(a[0])
+    if op=='backup-settings-save' and len(a)==5:return save_backup_settings(*a)
+    if op=='restore-export' and len(a)==2:return export_restore_snapshot(*a)
+    if op=='branding-icon-status' and len(a)==1:return branding_icon_status(a[0])
+    if op=='branding-icon-upload' and len(a)==1:return branding_icon_upload(a[0])
+    if op=='settings' and len(a)==1:return properties_dict(a[0])
+    if op=='settings-save' and len(a)==1:
+        raw=sys.stdin.buffer.read(16000)
+        return save_settings(a[0],json.loads(raw.decode('utf-8')))
+    if op=='announce' and len(a)==2:return broadcast_announcement(a[0],a[1])
+    if op=='schedule-read' and len(a)==1:
+        return schedule_bridge('read',a[0])
+    if op=='schedule-save' and len(a)==1:
+        raw=sys.stdin.buffer.read(8192)
+        if len(raw)>8191:raise ValueError('Schedule too large')
+        return schedule_bridge('save',a[0],raw.decode('utf-8'))
+    if op=='schedule-test' and len(a)==1:
+        return schedule_bridge('test',a[0])
+    if op=='schedule-history' and len(a)==1:
+        return schedule_bridge('history',a[0])
+
+    if op=='players' and len(a) in (2,3):return player_action(a[0],a[1],a[2] if len(a)==3 else None)
+    if op=='stats' and len(a)==1:return stats_server(a[0])
+    if op=='insights' and len(a)==1:return server_insights(a[0])
+    if op=='history' and len(a)==1:return operational_history(a[0])
+    if op=='control-center' and len(a)==1:return control_center(a[0])
+    if op=='resource-plan' and len(a)==4:return resource_plan(*a)
+    if op=='resource-policy' and len(a)==1:return resource_policy(a[0])
+    if op=='cpu-quota' and len(a)==2:return apply_cpu_quota(a[0],a[1])
+    if op=='addons' and len(a)==1:return addon_catalog(a[0])
+    if op=='addon-toggle' and len(a)==3:return toggle_addon(a[0],a[1],a[2]=='enable')
+    if op=='snapshots-json' and len(a)==1:return snapshot_objects(a[0])
+    if op=='restore' and len(a)==3:return restore_snapshot(a[0],a[1],a[2])
+    if op=='files' and len(a)==1:return file_catalog(a[0])
+    if op=='file-read' and len(a)==2:return read_config(a[0],a[1])
+    if op=='file-save' and len(a)==2:
+        raw=sys.stdin.buffer.read(1024*1024+1)
+        if len(raw)>1024*1024:raise ValueError('Config content too large')
+        return save_config(a[0],a[1],raw.decode('utf-8'))
+    if op=='file-upload' and len(a)==3:return upload_file(a[0],a[1],a[2])
+    if op=='list' and len(a)==0:
+        return [{**info(i),'state':state(service_name(i)),'rcon':rcon_ready(i)} for i in ['neoforge',*sorted(registry())]]
+    if op=='player-activity' and len(a)==1:return player_activity(a[0])
+    if op=='logs' and len(a)==1:
+        unit=service_name(a[0]);return run(['journalctl','-u',unit,'-n','80','--no-pager','--output=short-iso'],timeout=15,check=False)
+    if op=='service' and len(a)==2:
+        id,action=a
+        if action not in ('start','stop','restart'):raise ValueError('Invalid action')
+        unit=service_name(id)
+        if action in ('start','restart') and id!='neoforge' and registry()[id].get('type')=='spigot' and not (managed_path(id)/'build-success').exists():raise ValueError('Spigot build is not ready; check build status')
+        if action in ('start','restart'):
+            # Starting any server in Cockpit automatically stops the other instances.
+            # Restart an already running server without interfering with others only after
+            # exclusive ownership is established.
+            result=switch_server(id)
+            if action=='restart' and id not in result['stopped']:
+                run(['systemctl','restart',unit],timeout=180)
+            return {'state':state(unit),'stopped':result['stopped']}
+        run(['systemctl','stop',unit],timeout=180)
+        return {'state':state(unit)}
+    if op=='command' and len(a)==2:return rcon_command(a[0],a[1])
+    if op=='enable-rcon' and len(a)==1:return enable_rcon(a[0])
+    if op=='switch' and len(a)==1:return switch_server(a[0])
+    if op=='backup' and len(a) in (0,1):return backup_selected(a[0] if a else 'neoforge')
+    if op=='snapshots' and len(a) in (0,1):return snapshots_selected(a[0] if a else 'neoforge')
+    if op=='versions' and len(a)==0:return minecraft_versions()
+    if op=='upgrade-vanilla' and len(a)==2:return upgrade_vanilla(a[0],a[1])
+    if op=='create' and len(a) in (4,5):return do_create(a[0],a[1],a[2],a[3],a[4] if len(a)==5 else '')
+    if op=='relocate' and len(a)==2:return relocate_server(a[0],a[1])
+    if op=='build-status' and len(a)==1:return build_status(a[0])
+    raise ValueError('Unknown operation or invalid arguments')
+
+if __name__=='__main__':
+    try:
+        if sys.argv[1:2]==['build-spigot'] and len(sys.argv)==3:
+            build_spigot_worker(sys.argv[2]);sys.exit(0)
+        if os.geteuid()!=0:raise PermissionError('Cockpit administrative access is required')
+        print(json.dumps({'ok':True,'data':main(sys.argv[1:])}))
+    except Exception as exc:
+        print(json.dumps({'ok':False,'error':str(exc)[:1200]}))
+        sys.exit(0)

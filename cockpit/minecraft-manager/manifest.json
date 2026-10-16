@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "tools": {
+    "minecraft": {
+      "label": "Minecraft Console",
+      "path": "index.html",
+      "order": 55
+    }
+  }
+}

@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Bounded, read-only Minecraft inventory and append-only observed event history."""
+import datetime as dt, hashlib, json, os, pathlib, re, sqlite3, subprocess, sys, time
+MAIN='/usr/local/libexec/cockpit-minecraft-helper'
+STATE=pathlib.Path('/var/lib/cockpit-minecraft-records')
+PASS=os.environ.get('COCKPIT_MC_RESTIC_PASSWORD_FILE', '/etc/minecraft-backup/restic-password')
+def run(argv,timeout=60):
+ p=subprocess.run(argv,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=timeout,check=False)
+ if p.returncode: raise RuntimeError((p.stderr or p.stdout)[-350:])
+ return p.stdout
+def api(*args):
+ x=json.loads(run([MAIN,*args]));
+ if not x.get('ok'):raise ValueError(x.get('error','Helper error'))
+ return x['data']
+def directory_size(root,max_files=200000):
+ total=0;count=0;complete=True
+ if not root.is_dir() or root.is_symlink():return {'bytes':0,'files':0,'complete':False}
+ stack=[root]
+ while stack:
+  folder=stack.pop()
+  try:
+   with os.scandir(folder) as it:
+    for e in it:
+     if count>=max_files:complete=False;stack.clear();break
+     count+=1
+     try:
+      if e.is_symlink():continue
+      if e.is_dir(follow_symlinks=False):stack.append(pathlib.Path(e.path))
+      elif e.is_file(follow_symlinks=False):total+=e.stat(follow_symlinks=False).st_size
+     except OSError:complete=False
+  except OSError:complete=False
+ return {'bytes':total,'files':count,'complete':complete}
+def human(num):
+ for u in ('B','KiB','MiB','GiB','TiB'):
+  if num<1024:return f'{num:.1f} {u}'
+  num/=1024
+ return f'{num:.1f} PiB'
+def server(sid):
+ data=api('list')
+ for s in data:
+  if s.get('id')==sid:return s
+ raise ValueError('Unknown server id')
+def storage(s):
+ root=pathlib.Path(s['path']); d=directory_size(root)
+ # World folder is a conventional default; do not guess actual configured world if absent.
+ world='world'
+ try:
+  props=root/'server.properties'
+  if props.is_file() and not props.is_symlink():
+   for line in props.read_text(errors='replace').splitlines():
+    if line.startswith('level-name='):world=line.split('=',1)[1].strip();break
+ except OSError:pass
+ w=root/world
+ if not world or '/' in world or '\\' in world or world in ('.','..'):w=root/'world'
+ wd=directory_size(w)
+ return {'path':str(root),'total_bytes':d['bytes'],'total_human':human(d['bytes']),'files':d['files'],'complete':d['complete'],'world_path':str(w),'world_human':human(wd['bytes'])+(' (partial)' if not wd['complete'] else '')}
+def backups(sid,s):
+ cfg=api('backup-settings',sid);repo=cfg['repository'];p=pathlib.Path(repo)
+ if not p.is_dir():raise ValueError('Backup repository unavailable/unmounted: '+repo)
+ raw=run(['restic','--repo',repo,'--password-file',PASS,'snapshots','--json'],timeout=120)
+ entries=json.loads(raw);root=str(pathlib.Path(s['path']))
+ tag='minecraft-manual' if sid=='neoforge' else 'mc-server-'+sid
+ snaps=[];matching=[]
+ for v in entries:
+  paths=[str(x) for x in v.get('paths',[]) if isinstance(x,str)]
+  tags=v.get('tags',[])
+  match=(tag in tags or root in paths)
+  item={'id':v.get('id',''),'time':v.get('time',''),'paths':paths,'match':match}
+  snaps.append(item)
+  if match:matching.append(item)
+ snaps.sort(key=lambda x:x['time'],reverse=True)
+ repo_info=directory_size(p,100000)
+ return {'repository':repo,'repo_human':human(repo_info['bytes'])+(' (partial scan)' if not repo_info['complete'] else ''),'total':len(snaps),'selected':len(matching),'other':len(snaps)-len(matching),'oldest':min((x['time'] for x in matching),default=''),'newest':max((x['time'] for x in matching),default=''),'snapshots':snaps[:3000],'warning':'Showing first 3,000 snapshots' if len(snaps)>3000 else ''}
+PLAYER=re.compile(r'([A-Za-z0-9_]{3,16})')
+PATTERNS=[('join',re.compile(r'(?:System chat: )?([A-Za-z0-9_]{3,16}) joined the game')),('leave',re.compile(r'(?:System chat: )?([A-Za-z0-9_]{3,16}) left the game')),('death',re.compile(r'(?:System chat: )?([A-Za-z0-9_]{3,16}) (?:was |died|fell |hit |burned |drowned|blew |tried |suffocated|starved|froze|walked |went |discovered )')),('chat',re.compile(r'<([A-Za-z0-9_]{3,16})> '))]
+def database():
+ STATE.mkdir(mode=0o700,parents=True,exist_ok=True);os.chmod(STATE,0o700)
+ db=sqlite3.connect(STATE/'history.sqlite3',timeout=8)
+ os.chmod(STATE/'history.sqlite3',0o600)
+ db.execute('CREATE TABLE IF NOT EXISTS events (server TEXT, uid TEXT, timestamp TEXT, kind TEXT, player TEXT, message TEXT, PRIMARY KEY (server,uid))')
+ db.execute('CREATE TABLE IF NOT EXISTS notes (server TEXT, player TEXT, note TEXT, updated TEXT, PRIMARY KEY(server,player))')
+ return db
+def collect(db,sid,s):
+ # Replay a bounded recent window, deduplicating across refreshes; cannot recover rotated logs.
+ raw=run(['journalctl','--no-pager','--output=json','-u',s['unit'],'--since=-7 days','-n','12000'],timeout=45)
+ added=0
+ for line in raw.splitlines():
+  try:
+   obj=json.loads(line);msg=obj.get('MESSAGE',''); stamp=dt.datetime.fromtimestamp(int(obj.get('__REALTIME_TIMESTAMP',0))/1e6,dt.timezone.utc).isoformat();uid=obj.get('__CURSOR') or hashlib.sha256((stamp+msg).encode()).hexdigest()
+   if not isinstance(msg,str):continue
+   for kind,pattern in PATTERNS:
+    m=pattern.search(msg)
+    if m:
+     db.execute('INSERT OR IGNORE INTO events VALUES(?,?,?,?,?,?)',(sid,uid,stamp,kind,m.group(1),msg[-500:]))
+     added+=1;break
+  except (ValueError,KeyError,TypeError):continue
+ db.commit();return 'Last 12,000 journal entries (7-day window); older retained database records remain'
+def report(sid):
+ s=server(sid);db=database();scan_note='Unavailable'
+ try:scan_note=collect(db,sid,s)
+ except Exception as exc:scan_note='Journal unavailable: '+str(exc)[:150]
+ players=db.execute('SELECT player,SUM(kind="join"),SUM(kind="leave"),SUM(kind="death"),SUM(kind="chat"),MAX(timestamp) FROM events WHERE server=? GROUP BY player ORDER BY MAX(timestamp) DESC LIMIT 250',(sid,)).fetchall()
+ events=db.execute('SELECT timestamp,kind,player,message FROM events WHERE server=? ORDER BY timestamp DESC LIMIT 100',(sid,)).fetchall()
+ count=db.execute('SELECT COUNT(*) FROM events WHERE server=?',(sid,)).fetchone()[0]
+ bk={'repository':'Unavailable','repo_human':'Unknown','total':'?','selected':'?','other':'?','oldest':'','newest':'','snapshots':[],'warning':''}
+ try:bk=backups(sid,s)
+ except Exception as e:bk['warning']='Backup inventory unavailable: '+str(e)[:220]
+ return {'storage':storage(s),'backups':bk,'players':[dict(zip(['name','joins','leaves','deaths','chats','last_seen'],p)) for p in players],'events':[dict(zip(['time','type','player','message'],e)) for e in events],'event_count':count,'scan_note':scan_note}
+def valid_player(name):
+ if not re.fullmatch(r'[A-Za-z0-9_]{3,16}',name):raise ValueError('Invalid Minecraft player name')
+ return name.lower()
+def main():
+ op=sys.argv[1];sid=sys.argv[2];server(sid)
+ if op=='report':return report(sid)
+ if op=='note-read':
+  name=valid_player(sys.argv[3]);db=database();record=db.execute('SELECT note,updated FROM notes WHERE server=? AND player=?',(sid,name)).fetchone();return {'note':record[0] if record else '', 'updated':record[1] if record else None}
+ if op=='note-save':
+  name=valid_player(sys.argv[3]);note=sys.stdin.read(2049)
+  if len(note)>2000:raise ValueError('Note exceeds 2,000 characters')
+  db=database();db.execute('INSERT INTO notes VALUES(?,?,?,?) ON CONFLICT(server,player) DO UPDATE SET note=excluded.note, updated=excluded.updated',(sid,name,note,dt.datetime.now(dt.timezone.utc).isoformat()));db.commit();return {'saved':True}
+ raise ValueError('Unsupported operation')
+if __name__=='__main__':
+ try:print(json.dumps({'ok':True,'data':main()}))
+ except Exception as exc:print(json.dumps({'ok':False,'error':str(exc)[:300]}))

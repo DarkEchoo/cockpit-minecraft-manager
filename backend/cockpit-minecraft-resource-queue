@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""Per-server resource change queue. Root-run helper, never stops/starts servers."""
+import fcntl,json,os,pathlib,re,subprocess,sys,time
+BASE=pathlib.Path('/var/lib/cockpit-minecraft/v9-queued')
+V9='/usr/local/libexec/cockpit-minecraft-scheduler-v9'
+REG=pathlib.Path('/etc/cockpit-minecraft/servers.json')
+KEYS=('cpu_percent','memory_max_gib','heap_min_gib','heap_max_gib')
+def server(s):
+    if s=='neoforge': return 'minecraft-26.service'
+    if not re.fullmatch(r'[a-z][a-z0-9-]{1,34}',s):raise ValueError('Invalid server identifier')
+    db=json.loads(REG.read_text())
+    if s not in db:raise ValueError('Server not registered')
+    return 'mc-managed-'+s+'.service'
+def run(args,**kw):return subprocess.run(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=40,**kw)
+def is_running(s):return run(['systemctl','is-active',server(s)]).stdout.strip()=='active'
+def validate(s,c):
+    server(s)
+    if not isinstance(c,dict) or set(c)!=set(KEYS):raise ValueError('Expected CPU, memory, and JVM fields')
+    if any(isinstance(c[k],bool) or not isinstance(c[k],int) for k in KEYS):raise ValueError('All settings must be integers')
+    cpu,mem,mn,mx=(c[k] for k in KEYS)
+    if not 0<=cpu<=2800 or not 0<=mem<=26:raise ValueError('Invalid CPU or service memory limit')
+    if (mn or mx) and not 1<=mn<=mx<=24:raise ValueError('Invalid JVM heap range')
+    if mem and mx and mem<mx+1:raise ValueError('MemoryMax needs at least 1 GiB headroom above Xmx')
+    if s=='neoforge' and (mn or mx):raise ValueError('NeoForge JVM heap is edited in the existing launcher tool; keep Xms/Xmx at 0 here')
+def path(s):server(s);return BASE/(s+'.json')
+def read(s):
+    p=path(s)
+    return json.loads(p.read_text()) if p.is_file() else None
+def atomic(p,obj):
+    BASE.mkdir(mode=0o700,parents=True,exist_ok=True)
+    tmp=p.with_name(p.name+'.tmp-'+str(os.getpid()))
+    try:
+        with open(tmp,'x') as f:json.dump(obj,f,indent=2);f.write('\n');f.flush();os.fsync(f.fileno())
+        os.chmod(tmp,0o600);os.replace(tmp,p)
+    finally:tmp.unlink(missing_ok=True)
+def locked(fn):
+    BASE.mkdir(mode=0o700,parents=True,exist_ok=True)
+    with open(BASE/'.lock','a+') as f:
+        fcntl.flock(f,fcntl.LOCK_EX)
+        return fn()
+def status(s):
+    d=read(s)
+    return {'server':s,'running':is_running(s),'pending':d if d and d.get('state') in ('queued','failed') else None,'last':d if d and d.get('state') in ('applied','cancelled') else None}
+def enqueue(s,c):
+    validate(s,c)
+    def save():
+        d={'server':s,'state':'queued','config':c,'created':int(time.time()),'note':'Apply once service is inactive; no automatic stop or restart'}
+        atomic(path(s),d);return status(s)
+    return locked(save)
+def cancel(s):
+    def work():
+        d=read(s)
+        if not d or d.get('state') not in ('queued','failed'):return status(s)
+        d.update(state='cancelled',updated=int(time.time()));atomic(path(s),d)
+        return status(s)
+    return locked(work)
+def apply(s):
+    d=read(s)
+    if not d or d.get('state')!='queued':return False
+    if is_running(s):return False
+    c=d['config'];validate(s,c)
+    p=run([V9,'resources',s],input=json.dumps(c))
+    if p.returncode:
+        # No retries on failure; user can explicitly requeue after fixing the issue.
+        d.update(state='failed',updated=int(time.time()),error=(p.stdout+' '+p.stderr).strip()[:450]);atomic(path(s),d)
+        return False
+    try:
+        response=json.loads(p.stdout)
+        if not response.get('ok'):raise ValueError(response.get('error','Backend rejected update'))
+        expected=f'CPUQuota={c["cpu_percent"]}%' if c['cpu_percent'] else 'CPUQuota=infinity'
+        expmem=f'MemoryMax={c["memory_max_gib"]}G' if c['memory_max_gib'] else 'MemoryMax=infinity'
+        conf=pathlib.Path('/etc/systemd/system')/(server(s)+'.d/90-cockpit-resource-v9.conf')
+        txt=conf.read_text()
+        if expected not in txt.splitlines() or expmem not in txt.splitlines():raise ValueError('Readback did not match resource policy')
+        if is_running(s):raise ValueError('Server started during application; inspect effective limits')
+        d.update(state='applied',updated=int(time.time()),verified=True);atomic(path(s),d)
+        return True
+    except Exception as e:
+        d.update(state='failed',updated=int(time.time()),error=str(e)[:450]);atomic(path(s),d)
+        return False
+def tick():
+    def work():
+        result={}
+        for p in BASE.glob('*.json'):
+            if p.is_symlink():continue
+            try: result[p.stem]='applied' if apply(p.stem) else 'skipped'
+            except Exception as e:result[p.stem]='error: '+str(e)[:150]
+        return result
+    return locked(work)
+def main():
+    if os.geteuid():raise PermissionError('Run as root through Cockpit elevation')
+    if len(sys.argv)<2:raise ValueError('Missing operation')
+    op=sys.argv[1]
+    if op=='tick':return tick()
+    if len(sys.argv)!=3:raise ValueError('Missing server ID')
+    s=sys.argv[2];server(s)
+    if op=='status':return status(s)
+    if op=='cancel':return cancel(s)
+    if op=='queue':
+        data=json.loads(sys.stdin.buffer.read(4096).decode())
+        return enqueue(s,data)
+    raise ValueError('Unknown operation')
+if __name__=='__main__':
+    try:print(json.dumps({'ok':True,'data':main()}))
+    except Exception as e:print(json.dumps({'ok':False,'error':str(e)[:450]}));sys.exit(1)
