@@ -18,6 +18,7 @@ PROJECT = Path(__file__).resolve().parents[1]
 PARTS = (("cockpit/minecraft-manager", "usr/local/share/cockpit/minecraft-manager"),
          ("backend", "usr/local/libexec"),
          ("addons/backup-manager/helpers", "usr/local/libexec"))
+PRESERVE_EXISTING = frozenset(("minecraft-default-proxy", "minecraft-join-announcer", "minecraft-manual-backup"))
 TRANSACTION = "var/lib/cockpit-minecraft-manager/installer/pending"
 STATE = "journal.json"
 
@@ -66,6 +67,9 @@ def inventory(repo, prefix):
             found.add(relative)
             dest = guarded_path(prefix, relative)
             regular_or_missing(dest)
+            if path.name in PRESERVE_EXISTING and dest.exists():
+                # These helpers can contain host-specific behavior. Never replace live copies.
+                continue
             old = dest.stat() if dest.exists() else None
             records.append({"path": relative, "source": str(path.relative_to(repo)),
                             "new_hash": checksum(path),
