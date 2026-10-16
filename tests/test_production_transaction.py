@@ -45,6 +45,24 @@ class ProductionTransactionFixtures(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,"Symlink"):
                 tx.inventory(repo,root)
             self.assertFalse((root/tx.TRANSACTION).exists())
+    def test_partial_file_copy_can_be_recovered(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            root=Path(tmp);repo,old=self.setup(root)
+            original=tx.shutil.copyfile
+            fired=[False]
+            def interrupted(source,destination,*args,**kwargs):
+                if ".mc-install-" in str(destination) and not fired[0]:
+                    fired[0]=True
+                    Path(destination).write_text("half written")
+                    raise OSError("disk interruption")
+                return original(source,destination,*args,**kwargs)
+            with patch.object(tx.shutil,"copyfile",side_effect=interrupted):
+                with self.assertRaisesRegex(OSError,"disk interruption"):
+                    tx.apply(repo,root)
+            tx.recover(root)
+            self.assertEqual((old/"app.js").read_text(),"old")
+            self.assertFalse(list(root.rglob(".mc-install-*")))
     def test_outstanding_install_refused(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
             root=Path(tmp);repo,_=self.setup(root)
