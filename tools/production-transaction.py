@@ -146,6 +146,10 @@ def apply(repo, prefix):
             src = guarded_path(repo, entry["source"])
             if checksum(src) != entry["new_hash"]:
                 raise ValueError("Package source changed")
+            if entry["old_hash"] is not None and (not dest.is_file() or checksum(dest) != entry["old_hash"]):
+                raise ValueError("Target changed since preflight: " + entry["path"])
+            if entry["old_hash"] is None and dest.exists():
+                raise ValueError("New destination appeared: " + entry["path"])
             dest.parent.mkdir(parents=True, exist_ok=True)
             tmp = dest.with_name(".mc-install-" + str(number))
             if tmp.exists() or tmp.is_symlink():
@@ -159,6 +163,8 @@ def apply(repo, prefix):
             with tmp.open("rb") as stream: os.fsync(stream.fileno())
             os.replace(tmp, dest)
             syncdir(dest.parent)
+            if checksum(dest) != entry["new_hash"]:
+                raise OSError("Post-install checksum mismatch")
         return {"applied": len(records), "rollback_available": str(tx)}
     except Exception:
         # Keep the journal for explicit recovery; never discard backup on failure.
@@ -188,6 +194,13 @@ def recover(prefix):
             with temp.open("rb") as stream: os.fsync(stream.fileno())
             os.replace(temp, dest)
             syncdir(dest.parent)
+    for number, entry in enumerate(records):
+        dest = guarded_path(prefix, entry["path"])
+        install_temp = dest.with_name(".mc-install-" + str(number))
+        if install_temp.exists() or install_temp.is_symlink():
+            if install_temp.is_symlink() or not install_temp.is_file():
+                raise ValueError("Unsafe leftover install staging path")
+            install_temp.unlink()
     shutil.rmtree(tx)
     syncdir(tx.parent)
     return {"restored": len(records)}
