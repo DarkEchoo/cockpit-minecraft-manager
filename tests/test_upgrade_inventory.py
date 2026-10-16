@@ -28,7 +28,7 @@ class UpgradeInventoryTests(unittest.TestCase):
             self.assertFalse(result["safe_to_apply"])
             self.assertEqual(len(result["files"]), 2)
             self.assertEqual({e["action"] for e in result["files"]},
-                             {"replace-existing-file", "install-new-file"})
+                             {"replace-existing-file", "review-backend-path"})
             self.assertEqual((target_front / "index.html").read_text(), "old")
 
     def test_symlink_destination_blocks_path(self):
