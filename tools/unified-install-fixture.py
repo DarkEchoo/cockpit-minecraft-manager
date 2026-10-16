@@ -33,6 +33,11 @@ def install_fixture(repo, root, fail_after=None):
  manifest=stage_mod.stage(repo,stage_dir)
  for item in manifest["files"]:
   p=target/item["path"]
+  ancestor=p
+  while ancestor != target:
+   if ancestor.is_symlink():
+    raise ValueError("Symlink in destination path refused: "+str(ancestor))
+   ancestor=ancestor.parent
   if p.is_symlink():
    raise ValueError("Symlink destination refused")
   if p.exists() and not p.is_file():
@@ -59,24 +64,34 @@ def install_fixture(repo, root, fail_after=None):
   for entry in manifest["files"]:
    relative=Path(entry["path"])
    dest=target/relative
+   # Record the target BEFORE writing: copy errors must also roll back.
+   installed.append(dest)
    shutil.copy2(stage_dir/relative,dest)
    if hashlib.sha256(dest.read_bytes()).hexdigest()!=entry["sha256"]:
     raise RuntimeError("Checksum mismatch after fixture copy")
-   installed.append(dest)
    if fail_after is not None and len(installed)>=fail_after:
     raise RuntimeError("Injected install failure")
   return {"ok":True,"files":len(installed),"production_apply_enabled":False}
  except Exception:
+  failures=[]
   for dest,prev in reversed(records):
    if dest in installed or (dest.exists() and prev is None):
-    if prev is None:
-     dest.unlink(missing_ok=True)
-    else:
-     shutil.copy2(prev,dest)
+    try:
+     if prev is None:
+      dest.unlink(missing_ok=True)
+     else:
+      shutil.copy2(prev,dest)
+    except OSError as err:
+     failures.append(f"{dest}: {err}")
+  if failures:
+   # Recovery snapshot MUST survive a failed rollback.
+   raise RuntimeError("Rollback incomplete; original backups preserved at "
+                      +str(snapshot)+": "+"; ".join(failures))
   raise
  finally:
-  shutil.rmtree(stage_dir)
-  shutil.rmtree(snapshot)
+  shutil.rmtree(stage_dir,ignore_errors=True)
+  if not snapshot.exists() or not locals().get("failures"):
+   shutil.rmtree(snapshot,ignore_errors=True)
 
 def main():
  p=argparse.ArgumentParser(description=__doc__)
