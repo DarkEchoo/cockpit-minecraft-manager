@@ -14,6 +14,7 @@ class LiveModpackCompatibilityTests(unittest.TestCase):
         dispatch=getsource(mod.main)
         self.assertIn("loader-plan",dispatch)
         self.assertIn("preflight",dispatch)
+        self.assertIn("stage-fabric",dispatch)
     def test_java_minimum_baselines(self):
         self.assertEqual(mod._required_java_major("1.20.4"),17)
         self.assertEqual(mod._required_java_major("1.20.5"),21)
