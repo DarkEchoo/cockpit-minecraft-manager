@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""v0.8: stopped-workspace backup, checksum verify, isolated restore drill.
+No writes to live Minecraft workspaces and no service operations.
+"""
+import os,sys,json,re,stat,tarfile,hashlib,tempfile,shutil,subprocess,time,pathlib
+import sys as _sys;_sys.path.insert(0,'/usr/local/libexec')
+from mc_backup_config import load as _load_config, mount_check as _mount_check
+_CFG=_load_config()
+
+ROOT=pathlib.Path(_CFG['workspace_root'])
+NAME=re.compile(r'^[a-z][a-z0-9-]{1,34}$')
+MAX_FILES=100000
+MAX_BYTES=30*1024**3
+
+def fail(msg): raise ValueError(msg)
+def sha(p):
+ h=hashlib.sha256()
+ with open(p,'rb') as f:
+  for b in iter(lambda:f.read(1024*1024),b''):h.update(b)
+ return h.hexdigest()
+def workspace(name):
+ if not NAME.fullmatch(name):fail('Invalid workspace ID')
+ root=ROOT.resolve(strict=True)
+ p=root/name
+ if p.is_symlink() or not p.is_dir() or p.resolve()!=p or p.parent!=root:fail('Invalid workspace path')
+ if not (p/'modpack.json').is_file() or (p/'modpack.json').is_symlink():fail('Workspace manifest missing')
+ return p
+
+def stopped(name):
+ unit='mc-managed-'+name+'.service'
+ r=subprocess.run(['systemctl','is-active',unit],capture_output=True,text=True,timeout=10)
+ if r.stdout.strip() not in ('inactive','failed','unknown') or r.returncode==0:fail('Service must be stopped: '+unit)
+ # A missing unit is unsafe, not proof of stopped.
+ s=subprocess.run(['systemctl','show',unit,'--property=LoadState','--value'],capture_output=True,text=True,timeout=10)
+ if s.returncode or s.stdout.strip()!='loaded':fail('Systemd service not available for stopped-state validation')
+ return unit
+
+def destination(folder,output):
+ p=pathlib.Path(folder)
+ if p.is_symlink() or not p.is_dir() or p.resolve()!=p:fail('Destination must be an existing non-symlink directory')
+ _mount_check(_CFG)
+ if p!=pathlib.Path(_CFG['backup_directory']):fail('Destination differs from configured backup directory')
+ m=subprocess.run(['findmnt','-T',str(p),'-no','SOURCE,FSTYPE,TARGET,OPTIONS'],capture_output=True,text=True,timeout=10)
+ if m.returncode:fail('Destination mount unavailable')
+ fields=m.stdout.strip().split(' ',3)
+ if len(fields)<4:fail('Destination mount information invalid')
+ a=os.stat(output);b=os.stat(p)
+ if a.st_dev==b.st_dev:fail('Backup destination must be on a different filesystem')
+ if shutil.disk_usage(p).free<256*1024*1024:fail('Destination has under 256 MiB free')
+ return str(p),fields
+
+def entries(root):
+ result=[];total=0
+ for current,dirs,files in os.walk(root,followlinks=False):
+  for name in sorted(dirs+files):
+   p=pathlib.Path(current)/name
+   s=p.lstat()
+   if not (stat.S_ISREG(s.st_mode) or stat.S_ISDIR(s.st_mode)):fail('Refusing link or special file: '+str(p))
+   if stat.S_ISREG(s.st_mode):
+    if s.st_nlink>1:fail('Refusing hard-linked file: '+str(p))
+    total+=s.st_size
+    if total>MAX_BYTES:fail('Workspace exceeds 30 GiB safety limit')
+   result.append(p)
+   if len(result)>MAX_FILES:fail('Workspace exceeds file-count limit')
+ return sorted(result),total
+
+def snapshot(name,folder):
+ root=workspace(name);unit=stopped(name);dest,mount=destination(folder,root)
+ files,total=entries(root)
+ now=time.strftime('%Y%m%dT%H%M%SZ',time.gmtime())
+ target=pathlib.Path(dest)/(name+'-'+now+'-'+str(os.getpid())+'.tar.gz')
+ partial=target.with_name(target.name+'.partial')
+ fd=None
+ try:
+  fd=os.open(partial,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+  with os.fdopen(fd,'wb') as out:
+   fd=None
+   with tarfile.open(fileobj=out,mode='w:gz',format=tarfile.PAX_FORMAT) as tar:
+    tar.add(root,arcname=name,recursive=False)
+    for p in files:
+     rel=p.relative_to(root)
+     tar.add(p,arcname=name+'/'+rel.as_posix(),recursive=False)
+   out.flush();os.fsync(out.fileno())
+  if stopped(name)!=unit:fail('Service state changed while backing up')
+  digest=sha(partial)
+  os.replace(partial,target)
+  manifest=target.with_name(target.name+'.sha256')
+  with open(manifest,'x',encoding='utf8') as f:
+   f.write(digest+'  '+target.name+'\n');f.flush();os.fsync(f.fileno())
+  return {'workspace':name,'archive':str(target),'sha256':digest,'checksum_file':str(manifest),'entries':len(files),'source_uncompressed_bytes':total,'source_service_stopped':True,'restore_tested':False,'world_modified':False}
+ finally:
+  if fd is not None:os.close(fd)
+  if partial.exists():partial.unlink()
+
+def check_archive(archive,extract=False):
+ p=pathlib.Path(archive)
+ if p.is_symlink() or not p.is_file() or not p.name.endswith('.tar.gz'):fail('Archive must be ordinary .tar.gz file')
+ checks=p.with_name(p.name+'.sha256')
+ if checks.is_symlink() or not checks.is_file():fail('Checksum sidecar missing')
+ line=checks.read_text(encoding='utf8').strip().split()
+ if len(line)!=2 or not re.fullmatch('[0-9a-f]{64}',line[0]) or line[1]!=p.name:fail('Invalid checksum sidecar')
+ actual=sha(p)
+ if actual!=line[0]:fail('SHA-256 mismatch')
+ count=0;total=0;top=None;members=[]
+ with tarfile.open(p,'r:gz') as t:
+  for info in t:
+   parts=pathlib.PurePosixPath(info.name).parts
+   if (not parts or any(x in ('','..','.') for x in parts) or info.name.startswith('/') or '\\' in info.name or not (info.isfile() or info.isdir())):fail('Unsafe archive entry')
+   if not NAME.fullmatch(parts[0]):fail('Invalid root directory name')
+   if top is None:top=parts[0]
+   if top!=parts[0]:fail('Multiple workspace roots')
+   count+=1;total+=info.size
+   if count>MAX_FILES or total>MAX_BYTES:fail('Archive exceeds safety limits')
+   members.append((info.name,info.isdir(),info.size))
+ if not members or not any(n==top+'/modpack.json' and not isdir for n,isdir,_ in members):fail('Missing manifest in archive')
+ result={'archive':str(p),'sha256':actual,'checksum_valid':True,'entry_count':count,'uncompressed_bytes':total,'workspace':top,'live_workspace_modified':False}
+ if extract:
+  if shutil.disk_usage('/var/tmp').free<total+128*1024*1024:fail('Not enough space for isolated restore test')
+  with tempfile.TemporaryDirectory(prefix='minecraft-restore-drill-',dir='/var/tmp') as temp:
+   # Manual extraction: no paths, links, or permissions from untrusted tar headers are honored.
+   root=pathlib.Path(temp)
+   with tarfile.open(p,'r:gz') as t:
+    for item in t:
+     q=root.joinpath(*pathlib.PurePosixPath(item.name).parts)
+     if item.isdir():q.mkdir(parents=True,exist_ok=True)
+     else:
+      q.parent.mkdir(parents=True,exist_ok=True)
+      with t.extractfile(item) as src,open(q,'xb') as out:shutil.copyfileobj(src,out,1024*1024)
+   manifest=root/top/'modpack.json'
+   if not isinstance(json.loads(manifest.read_text()),dict):fail('Isolated manifest validation failed')
+   result['isolated_restore_tested']=True
+   result['restore_target']='temporary directory cleaned after validation'
+ return result
+
+def main():
+ if len(sys.argv)<3:fail('Usage: backup <workspace> <existing-destination> | verify <archive> | restore-test <archive>')
+ op=sys.argv[1]
+ if op=='backup' and len(sys.argv)==4:r=snapshot(sys.argv[2],sys.argv[3])
+ elif op in ('verify','restore-test') and len(sys.argv)==3:r=check_archive(sys.argv[2],op=='restore-test')
+ else:fail('Invalid operation or argument count')
+ print(json.dumps({'ok':True,'data':r},indent=2))
+if __name__=='__main__':
+ try:main()
+ except Exception as e:
+  print(json.dumps({'ok':False,'error':str(e)}));sys.exit(1)

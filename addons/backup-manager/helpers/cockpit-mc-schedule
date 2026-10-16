@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""Timer controls restricted to the configured and validated workspace."""
+import json, subprocess, sys, re
+import sys as _sys;_sys.path.insert(0,'/usr/local/libexec')
+from mc_backup_config import load as _load_config, mount_check as _mount_check
+_CFG=_load_config()
+
+RUNNER='/usr/local/libexec/cockpit-mc-snapshot'
+NAME=_CFG.get('scheduled_workspace','')
+if not re.fullmatch(r'[a-z][a-z0-9-]{1,34}', NAME):raise RuntimeError('Configure scheduled_workspace')
+UNIT='cockpit-mc-snapshot@'+NAME+'.timer'
+SERVICE='cockpit-mc-snapshot@'+NAME+'.service'
+
+def run(*cmd, timeout=15):
+    return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, check=False)
+
+def fail(msg):
+    raise RuntimeError(msg)
+
+def status():
+    t=run('systemctl','show',UNIT,'--property=LoadState,UnitFileState,ActiveState,NextElapseUSecRealtime,LastTriggerUSec','--no-pager')
+    if t.returncode:fail('Cannot inspect timer: '+t.stderr.strip()[:300])
+    d=dict(line.split('=',1) for line in t.stdout.splitlines() if '=' in line)
+    if d.get('LoadState')!='loaded':fail('Expected timer is not installed')
+    s=run('systemctl','show',SERVICE,'--property=ActiveState,Result','--no-pager')
+    sd=dict(line.split('=',1) for line in s.stdout.splitlines() if '=' in line)
+    return {'workspace':NAME,'timer':UNIT,'timer_enabled':d.get('UnitFileState')=='enabled',
+            'timer_unit_state':d.get('UnitFileState'),'timer_active':d.get('ActiveState'),
+            'next_run':d.get('NextElapseUSecRealtime') or 'n/a',
+            'last_trigger':d.get('LastTriggerUSec') or 'n/a',
+            'backup_service_state':sd.get('ActiveState','unknown'),
+            'backup_service_result':sd.get('Result','unknown'),
+            'live_backup_supported':False,'retention_deletion_enabled':False}
+
+def main():
+    if len(sys.argv)!=3 or sys.argv[1] not in ('status','check','enable','disable') or sys.argv[2]!=NAME:
+        fail('Usage: cockpit-mc-schedule status|check|enable|disable <configured-workspace>')
+    op=sys.argv[1]
+    if op=='check':
+        p=run(RUNNER,'check',NAME)
+        if p.returncode:fail('Scheduler preflight failed: '+(p.stdout+p.stderr)[-600:])
+        data=json.loads(p.stdout)
+        if not data.get('ok'):fail('Scheduler preflight rejected workspace')
+        result={'preflight':data['data'],'changes_made':False}
+    elif op in ('enable','disable'):
+        # Don't alter Minecraft services, only this exact timer. No backups are started here.
+        if op=='enable':
+            p=run(RUNNER,'check',NAME)
+            if p.returncode or not json.loads(p.stdout).get('ok'):
+                fail('Refusing timer activation: scheduler preflight failed')
+        p=run('systemctl', 'enable','--now',UNIT) if op=='enable' else run('systemctl','disable','--now',UNIT)
+        if p.returncode:fail('systemctl failed: '+(p.stderr or p.stdout)[-500:])
+        result=status();result['action']=op
+    else:result=status()
+    print(json.dumps({'ok':True,'data':result},indent=2))
+
+if __name__=='__main__':
+    try:main()
+    except Exception as ex:
+        print(json.dumps({'ok':False,'error':str(ex)}));sys.exit(1)

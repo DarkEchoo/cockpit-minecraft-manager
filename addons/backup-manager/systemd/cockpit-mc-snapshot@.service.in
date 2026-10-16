@@ -1,0 +1,16 @@
+[Unit]
+Description=Managed Minecraft stopped-workspace backup (%i)
+RequiresMountsFor=@@BACKUP_DIR@@
+ConditionPathIsMountPoint=@@BACKUP_MOUNT@@
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/libexec/cockpit-mc-snapshot run %i
+TimeoutStartSec=35min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=@@BACKUP_DIR@@ /run/lock
+UMask=0077

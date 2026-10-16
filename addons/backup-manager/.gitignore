@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.bak
+*.log
+*.tar.gz
+*.sha256
+*.env
+backup-manager.json
+rcon.conf
+*password*
+world/
+world_*/

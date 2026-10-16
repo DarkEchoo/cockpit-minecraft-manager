@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily disabled-by-default Minecraft snapshot (%i)
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=false
+RandomizedDelaySec=15m
+Unit=cockpit-mc-snapshot@%i.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""v0.9 Cockpit backup center: non-destructive history, action logs, retention preview; delegates snapshots to validated v0.8."""
+import os,sys,json,re,stat,subprocess,pathlib,hashlib,datetime,shutil
+import sys as _sys;_sys.path.insert(0,'/usr/local/libexec')
+from mc_backup_config import load as _load_config, mount_check as _mount_check
+_CFG=_load_config()
+
+ROOT=pathlib.Path(_CFG['workspace_root'])
+BACKUP=pathlib.Path('/usr/local/libexec/cockpit-minecraft-backup')
+STORE=pathlib.Path(_CFG['backup_directory'])
+NAME=re.compile(r'^[a-z][a-z0-9-]{1,34}$')
+ARCHIVE=re.compile(r'^([a-z][a-z0-9-]{1,34})-(\d{8}T\d{6}Z)-([0-9]+)\.tar\.gz$')
+LIMIT=5000
+
+def fail(s):raise ValueError(s)
+def safe_root():
+ if STORE.is_symlink() or not STORE.is_dir() or STORE.resolve()!=STORE:fail('Backup directory unavailable or symlinked')
+ _mount_check(_CFG)
+ return STORE
+
+def get_history(name):
+ if name!='all' and not NAME.fullmatch(name):fail('Invalid workspace name')
+ root=safe_root();items=[]
+ for f in root.iterdir():
+  if len(items)>=LIMIT:fail('Too many backup files for safe listing')
+  if f.is_symlink() or not f.is_file():continue
+  m=ARCHIVE.fullmatch(f.name)
+  if not m or (name!='all' and m.group(1)!=name):continue
+  checksum=f.with_name(f.name+'.sha256')
+  items.append({'workspace':m.group(1),'archive':str(f),'bytes':f.stat().st_size,'created_utc':m.group(2),'checksum_present':checksum.is_file() and not checksum.is_symlink()})
+ return sorted(items,key=lambda x:(x['created_utc'],x['archive']),reverse=True)
+
+def logs(name):
+ # system journal contains information about attempted scheduled backups only; no filesystem mutations.
+ if name!='all' and not NAME.fullmatch(name):fail('Invalid workspace name')
+ cmd=['journalctl','--no-pager','-n','40','-o','short-iso','-t','cockpit-minecraft-backup']
+ x=subprocess.run(cmd,capture_output=True,text=True,timeout=15)
+ if x.returncode:fail('Journal access failed')
+ return {'recent':x.stdout.splitlines()[-40:],'note':'Journal entries are only present for actions logged by the scheduled backup wrapper.'}
+
+def record(op,workspace,ok):
+ try:subprocess.run(['logger','-t','cockpit-minecraft-backup',f'action={op} workspace={workspace} success={str(ok).lower()}'],timeout=5,check=False)
+ except Exception:pass
+
+def run_v08(op,params):
+ if not BACKUP.is_file() or BACKUP.is_symlink():fail('v0.8 backup helper not installed')
+ cmd=[str(BACKUP),op,*params]
+ x=subprocess.run(cmd,capture_output=True,text=True,timeout=300)
+ try:r=json.loads(x.stdout)
+ except:fail('Backup helper returned invalid JSON: '+x.stderr[-300:])
+ if not isinstance(r,dict) or 'ok' not in r:fail('Invalid response from backup helper')
+ record(op,params[0] if params else 'unknown',r['ok'])
+ return r
+
+def whitelist_archive(s):
+ root=safe_root();p=pathlib.Path(s)
+ if not p.is_absolute() or p.parent!=root or not ARCHIVE.fullmatch(p.name) or p.is_symlink() or not p.is_file():fail('Backup must be an existing regular archive directly under configured backup directory')
+ return str(p)
+
+def retention(name,keep):
+ try:k=int(keep)
+ except:fail('Retention count must be integer')
+ if not 2<=k<=100:fail('Retention must keep 2–100 snapshots')
+ lst=get_history(name)
+ if name=='all':fail('Choose a workspace for retention preview')
+ verified=[x for x in lst if x['checksum_present']]
+ # No deletion in v0.9. Do not describe all checksum sidecars as verified hashes.
+ return {'workspace':name,'keep_latest':k,'available':len(lst),'checksum_sidecars_present':len(verified),'candidate_archives':[x['archive'] for x in lst[k:]],'deleted':False,'warning':'Preview only. Sidecar presence is not checksum verification. A separate verified recovery point is required before implementing deletion.'}
+
+def main():
+ a=sys.argv[1:]
+ if len(a)==2 and a[0]=='history':r=get_history(a[1])
+ elif len(a)==2 and a[0]=='activity':r=logs(a[1])
+ elif len(a)==3 and a[0]=='retention-preview':r=retention(a[1],a[2])
+ elif len(a)==2 and a[0]=='backup':
+  if not NAME.fullmatch(a[1]):fail('Invalid workspace name')
+  safe_root();return print(json.dumps(run_v08('backup',[a[1],str(STORE)]),indent=2))
+ elif len(a)==2 and a[0] in ('verify','restore-test'):
+  return print(json.dumps(run_v08(a[0],[whitelist_archive(a[1])]),indent=2))
+ else:fail('Usage: history|activity|backup <workspace> ; retention-preview <workspace> <keep> ; verify|restore-test <archive>')
+ print(json.dumps({'ok':True,'data':r},indent=2))
+if __name__=='__main__':
+ try:main()
+ except Exception as e:print(json.dumps({'ok':False,'error':str(e)}));sys.exit(1)
