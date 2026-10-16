@@ -48,6 +48,16 @@ See the [complete screenshot gallery](docs/SCREENSHOTS.md).
 
 No public one-click installer is supplied in this development snapshot. The full deployed setup depends on other helpers, service users, systemd units, external programs, and private settings. First test changes on a disposable Linux VM and review privilege boundaries.
 
+### Run from any download location
+
+The installer finds its project files relative to its own location; your working directory does not matter. Extract the **entire** release archive (not just `install.sh`) and invoke the script by its path:
+
+```bash
+bash "/path/to/extracted release/install.sh" --check
+```
+
+The v1.2 development branch currently supports read-only checks only. `--apply` is deliberately blocked until production upgrade and rollback validation is complete.
+
 ## Security and privacy
 
 Do not commit API keys, RCON credentials, Restic password files, `server.properties`, worlds, server logs, hostnames/IPs, or real server archives. Store any future CurseForge API key in root-readable host configuration rather than frontend JavaScript. Review [SECURITY.md](SECURITY.md).
