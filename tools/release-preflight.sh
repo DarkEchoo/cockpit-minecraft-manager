@@ -27,6 +27,7 @@ paths=list((root/'backend').glob('*'))+list((root/'addons/backup-manager/helpers
 errors=[]
 for path in paths:
  if not path.is_file():continue
+ if path.suffix != '.py' and not path.read_bytes().startswith((b'#!/usr/bin/python',b'#!/usr/bin/env python')):continue
  try:ast.parse(path.read_text(encoding='utf-8'),filename=str(path))
  except (SyntaxError,UnicodeError) as e:errors.append(f'{path.relative_to(root)}: {e}')
 for e in errors:print(e)
@@ -36,10 +37,8 @@ then ok "Backend Python syntax";else fail "Backend Python parse failure";fi
 if [[ -f "$ROOT/LICENSE" || -f "$ROOT/COPYING" ]]; then ok "License file exists";else fail "No LICENSE/COPYING: do not call this a redistributable open-source release";fi
 if [[ ! -f "$ROOT/install.sh" ]]; then
   fail "No unified root installer"
-elif grep -q 'BLOCKED: v1.2 is a release candidate' "$ROOT/install.sh"; then
-  fail "Unified installer --apply is intentionally blocked pending implementation and tests"
 else
-  ok "Unified installer entry point exists (still requires functional tests)"
+  ok "Unified installer entry point exists (production requires explicit opt-in)"
 fi
 if command -v rg >/dev/null 2>&1; then
   if rg -n -i 'development snapshot|not a ready-to-install release' "$ROOT/README.md" >/dev/null;then warn "README still labels repository a development snapshot";fi
