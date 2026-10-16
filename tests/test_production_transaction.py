@@ -63,6 +63,16 @@ class ProductionTransactionFixtures(unittest.TestCase):
             tx.recover(root)
             self.assertEqual((old/"app.js").read_text(),"old")
             self.assertFalse(list(root.rglob(".mc-install-*")))
+    def test_preserves_existing_host_specific_proxy(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            root=Path(tmp);repo,_=self.setup(root)
+            (repo/"backend/minecraft-default-proxy").write_text("generic version")
+            actual=root/"usr/local/libexec/minecraft-default-proxy"
+            actual.parent.mkdir(parents=True)
+            actual.write_text("host custom version")
+            self.assertFalse(any(r["path"].endswith("/minecraft-default-proxy") for r in tx.inventory(repo,root)))
+            tx.apply(repo,root)
+            self.assertEqual(actual.read_text(),"host custom version")
     def test_outstanding_install_refused(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
             root=Path(tmp);repo,_=self.setup(root)
