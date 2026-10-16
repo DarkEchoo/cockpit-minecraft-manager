@@ -14,6 +14,10 @@ if (($#));then usage;exit 2;fi
 case "$MODE" in
   --check)
     echo 'v1.2 pre-install validation; no host changes will be made.'
+    if [[ "$HOST" == "--host" ]]; then
+      echo "Checking Cockpit installation and socket (read-only):"
+      python3 "$ROOT/tools/cockpit-prerequisite.py"
+    fi
     bash "$ROOT/tools/release-preflight.sh" $HOST
     ;;
   --apply)
