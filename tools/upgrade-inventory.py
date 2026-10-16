@@ -33,10 +33,15 @@ def build_plan(source, frontend_target=TARGET_FRONTEND, backend_target=TARGET_BA
             if dst.is_symlink() or (dst.exists() and not dst.is_file()):
                 blockers.append(f"Unsafe destination type: {dst}")
                 continue
+            # A missing backend destination may reflect a legacy install path.
+            # Do not classify it as safe to install without deployment review.
+            review_required = src_dir == source / BACKEND and not dst.exists()
+            if review_required:
+                blockers.append(f"Backend location/dependencies require review: {dst}")
             candidates.append({
                 "source": str(src),
                 "destination": str(dst),
-                "action": "replace-existing-file" if dst.exists() else "install-new-file",
+                "action": "replace-existing-file" if dst.exists() else ("review-backend-path" if review_required else "install-new-file"),
                 "backup_existing": dst.exists(),
                 "source_bytes": src.stat().st_size,
             })
