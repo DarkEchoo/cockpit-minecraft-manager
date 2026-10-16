@@ -73,6 +73,25 @@ class ProductionTransactionFixtures(unittest.TestCase):
             self.assertFalse(any(r["path"].endswith("/minecraft-default-proxy") for r in tx.inventory(repo,root)))
             tx.apply(repo,root)
             self.assertEqual(actual.read_text(),"host custom version")
+    def test_existing_console_feature_files_preserved(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            root=Path(tmp);repo,frontend=self.setup(root)
+            (repo/"backend/cockpit-minecraft-modpacks").write_text("packaged modpack backend")
+            (repo/"backend/cockpit-minecraft-records").write_text("packaged records")
+            (repo/"backend/cockpit-minecraft-join-control").write_text("packaged control")
+            (frontend/"app.js").write_text("live custom frontend")
+            helpers=root/"usr/local/libexec"
+            helpers.mkdir(parents=True,exist_ok=True)
+            for name in ("cockpit-minecraft-helper","cockpit-minecraft-modpacks","cockpit-minecraft-records","cockpit-minecraft-join-control"):
+                (helpers/name).write_text("live-"+name)
+            records=tx.inventory(repo,root)
+            paths={r["path"] for r in records}
+            for name in ("cockpit-minecraft-helper","cockpit-minecraft-modpacks","cockpit-minecraft-records","cockpit-minecraft-join-control"):
+                self.assertNotIn("usr/local/libexec/"+name,paths)
+            self.assertNotIn("usr/local/share/cockpit/minecraft-manager/app.js",paths)
+            tx.apply(repo,root)
+            self.assertEqual((frontend/"app.js").read_text(),"live custom frontend")
+            self.assertEqual((helpers/"cockpit-minecraft-modpacks").read_text(),"live-cockpit-minecraft-modpacks")
     def test_outstanding_install_refused(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
             root=Path(tmp);repo,_=self.setup(root)
