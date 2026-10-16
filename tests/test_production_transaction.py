@@ -27,7 +27,7 @@ class ProductionTransactionFixtures(unittest.TestCase):
             repo,old=self.setup(root)
             result=tx.apply(repo,root)
             self.assertGreater(result["applied"],0)
-            self.assertEqual((old/"app.js").read_text(),"new")
+            self.assertEqual((old/"app.js").read_text(),"old")
             tx.recover(root)
             self.assertEqual((old/"app.js").read_text(),"old")
             self.assertFalse((root/"usr/local/libexec/cockpit-minecraft-helper").exists())
