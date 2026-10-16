@@ -25,7 +25,7 @@ REQUIRED = {
     "cockpit": ("manifest.json", "index.html", "app.js",
                 "modpacks.js", "modpack-audit-ui.js", "modpack-backup-ui.js",
                 "modpack-schedule-ui.js"),
-    "backend": ("cockpit-minecraft-helper", "cockpit-minecraft-modpack-audit",),
+    "backend": ("cockpit-minecraft-helper", "cockpit-minecraft-modpack-audit", "minecraft-default-proxy", "minecraft-join-announcer"),
     "backup_helpers": ("mc_backup_config.py", "cockpit-mc-snapshot", "cockpit-mc-schedule",
                        "cockpit-minecraft-backup", "cockpit-minecraft-backup-center"),
     "backup_units_templates": ("cockpit-mc-snapshot@.service.in",
