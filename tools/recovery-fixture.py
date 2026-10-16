@@ -130,7 +130,15 @@ def recover(root):
         target = root / "installed" / entry["name"]
         if entry["existed"]:
             prior = txn / "backups" / str(entry["id"])
-            os.replace(prior, target)
+            # Keep the original backup intact until ALL recovery steps finish.
+            # A subsequent recover() can replay an interrupted restore.
+            temp = target.with_name(".mc-restore-" + str(entry["id"]) + ".tmp")
+            if temp.is_symlink() or temp.exists():
+                raise ValueError("Unexpected restoration temporary path")
+            shutil.copy2(prior, temp)
+            with open(temp, "rb") as handle:
+                os.fsync(handle.fileno())
+            os.replace(temp, target)
         elif target.exists():
             target.unlink()
         fsync_dir(target.parent)
