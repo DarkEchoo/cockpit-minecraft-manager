@@ -1,0 +1,14 @@
+# Reference template ONLY. Do not enable automatically. Review system user and host paths.
+[Unit]
+Description=Collect Minecraft service performance metrics (read-only)
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/libexec/cockpit-minecraft-metrics-collector
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/cockpit-minecraft-metrics
+ProtectHome=yes
+PrivateTmp=yes
