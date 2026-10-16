@@ -2,7 +2,7 @@
 
 A self-hosted Minecraft server-management interface for [Cockpit](https://cockpit-project.org/) on Linux, under active development.
 
-> **Development snapshot — not a ready-to-install release.** The source here is a sanitized snapshot of the existing manager. Some advanced features call additional local helper programs that are **not included**, and the code assumes Linux services and backup configuration exist. Do not run it on an unprotected production server without reviewing the code and dependencies.
+> **v1.2 release candidate.** The unified installer supports an explicit opt-in file-only transaction with rollback, but has not yet passed final validation on a disposable Ubuntu host and the existing production installation. Advanced tools require per-host services, mounts, users and configuration. Do not install on a critical system without reviewing the change plan and keeping an independent backup.
 
 ## Screenshots
 
@@ -21,7 +21,7 @@ A tour of the current Cockpit Minecraft Manager interface. Select an image to vi
 
 See the [complete screenshot gallery](docs/SCREENSHOTS.md).
 
-## Current functionality in the uploaded snapshot
+## Current console functionality
 
 - Browse and control independent managed Minecraft servers.
 - Create Vanilla, Spigot, Paper, and Purpur instances (subject to upstream availability).
@@ -46,7 +46,7 @@ See the [complete screenshot gallery](docs/SCREENSHOTS.md).
 
 ## Installation
 
-No public one-click installer is supplied in this development snapshot. The full deployed setup depends on other helpers, service users, systemd units, external programs, and private settings. First test changes on a disposable Linux VM and review privilege boundaries.
+The installer finds its files relative to its own location, so you can run it from Downloads or another extracted directory (keep the complete folder intact). Cockpit must already be installed and active.\n\n```bash\nbash "/path/to/extracted/install.sh" --check --host\nsudo bash "/path/to/extracted/install.sh" --plan\n```\n\nSee [installation, recovery, and limitations](docs/INSTALL_V12.md) for the gated install, rollback and finalization commands. The installer does not modify existing systemd units, timers, world data, backup mounts or credentials.
 
 ### Run from any download location
 
@@ -68,7 +68,7 @@ Personal, non-commercial educational project. Public GitHub repository is intend
 
 ## License
 
-No open-source license has been selected yet. Until one is added, the repository should not be assumed to permit reuse or redistribution.
+This repository uses a [proprietary source-available license](LICENSE); it is not open source. Official unmodified releases can be downloaded, installed and evaluated privately as specified in that license.
 
 
 > **Development-source warning:** This review snapshot includes all 11 examined Python helpers but is not a complete tested installer. Before any public release, verify runtime dependencies, credential handling, systemd units, platform portability, and all Git history. See `docs/AUDIT_REVIEW.md`.
