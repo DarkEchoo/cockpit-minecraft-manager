@@ -63,6 +63,33 @@ class RecoveryFixtureTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 rec.recover(root)
 
+    def test_recover_can_be_replayed_before_journal_cleanup(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp)
+            _, dst = self.fixture(root)
+            rec.prepare(root)
+            rec.apply_partial(root, 2)
+            # Inject an interruption after restoring a file by replacing the
+            # directory sync hook. Recovery must retain originals.
+            real_sync = rec.fsync_dir
+            count = [0]
+            def interrupted_sync(path):
+                count[0] += 1
+                if count[0] == 1:
+                    raise RuntimeError("simulated recovery interruption")
+                return real_sync(path)
+            try:
+                rec.fsync_dir = interrupted_sync
+                with self.assertRaises(RuntimeError):
+                    rec.recover(root)
+            finally:
+                rec.fsync_dir = real_sync
+            self.assertTrue((root / rec.JOURNAL / "backups/0").exists())
+            rec.recover(root)
+            self.assertEqual((dst / "a").read_text(), "old a")
+            self.assertFalse((dst / "b").exists())
+            self.assertEqual((dst / "untouched").read_text(), "keep")
+
     def test_unmarked_directory_refused(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
             with self.assertRaises(ValueError):
