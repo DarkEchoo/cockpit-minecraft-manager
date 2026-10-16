@@ -1,26 +1,20 @@
 Copyright (c) 2026 DarkEchoo. All rights reserved.
 
-PROPRIETARY SOURCE-AVAILABLE NOTICE
+PROPRIETARY SOURCE-AVAILABLE LICENSE
 
-The source code and related materials in this repository are made available
-for viewing and evaluation only. They are not licensed under an open-source
-license.
+Permission is granted to download, install, run, and privately evaluate
+unmodified official releases of this software, including on personal servers,
+subject to applicable third-party license terms.
 
-Except where applicable law expressly permits otherwise, no permission is
-granted to copy, distribute, sublicense, sell, publish modified versions of,
-or incorporate this software into other projects without prior written
-permission from the copyright holder.
+No permission is granted to redistribute the software, publish modified
+versions, sublicense, sell, or incorporate the software into another product
+without prior written permission from the copyright holder. You may modify a
+private copy for your own use, but may not distribute that modification.
 
-You may download or clone this repository solely to review and evaluate the
-software privately. Running, modifying, or redistributing this software for
-other purposes requires separate permission from the copyright holder.
-
-No license is granted to third-party dependencies, Minecraft, Cockpit, mod
-loaders, plugins, or other third-party works. Their respective licenses and
-terms continue to apply.
+This license does not grant any rights in Minecraft, Cockpit, Java, mods,
+plugins, dependencies, or third-party components. Their own terms govern.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, TO THE
 EXTENT PERMITTED BY APPLICABLE LAW.
 
-For permission requests, contact the repository owner through the GitHub
-repository.
+For additional permissions, contact the repository owner.
