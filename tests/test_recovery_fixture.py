@@ -90,6 +90,42 @@ class RecoveryFixtureTests(unittest.TestCase):
             self.assertFalse((dst / "b").exists())
             self.assertEqual((dst / "untouched").read_text(), "keep")
 
+    def test_missing_backup_rejected_before_writes(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp)
+            _, dst = self.fixture(root)
+            rec.prepare(root)
+            rec.apply_partial(root, 2)
+            (root / rec.JOURNAL / "backups/0").unlink()
+            with self.assertRaises(ValueError):
+                rec.recover(root)
+            self.assertEqual((dst / "a").read_text(), "new a")
+            self.assertTrue((dst / "b").exists())
+
+    def test_tampered_backup_rejected_before_writes(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp)
+            _, dst = self.fixture(root)
+            rec.prepare(root)
+            rec.apply_partial(root, 2)
+            (root / rec.JOURNAL / "backups/0").write_text("damaged")
+            with self.assertRaisesRegex(ValueError, "digest mismatch"):
+                rec.recover(root)
+            self.assertEqual((dst / "a").read_text(), "new a")
+            self.assertTrue((dst / "b").exists())
+
+    def test_existing_restore_temp_rejected_before_writes(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp)
+            _, dst = self.fixture(root)
+            rec.prepare(root)
+            rec.apply_partial(root, 2)
+            (dst / ".mc-restore-0.tmp").write_text("collision")
+            with self.assertRaisesRegex(ValueError, "temporary path"):
+                rec.recover(root)
+            self.assertEqual((dst / "a").read_text(), "new a")
+            self.assertTrue((dst / "b").exists())
+
     def test_unmarked_directory_refused(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
             with self.assertRaises(ValueError):
