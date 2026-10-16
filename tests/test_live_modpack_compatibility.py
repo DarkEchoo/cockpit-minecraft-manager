@@ -1,6 +1,8 @@
 import importlib.util
 from pathlib import Path
 import unittest
+import sys
+sys.dont_write_bytecode = True
 from unittest.mock import patch
 
 SOURCE=Path(__file__).resolve().parents[1]/"backend/cockpit-minecraft-modpacks"
