@@ -5,6 +5,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 usage(){
   echo 'Usage: bash install.sh --check [--host]'
+  echo '       sudo bash install.sh --plan (read-only file change inventory)'
   echo '       sudo bash install.sh --apply  (blocked until full install/upgrade acceptance tests pass)'
 }
 MODE="${1:---check}"; shift || true
@@ -25,6 +26,10 @@ case "$MODE" in
       fi
     fi
     bash "$ROOT/tools/release-preflight.sh" $HOST
+    ;;
+  --plan)
+    echo "Read-only proposed installation inventory; no files will be changed."
+    python3 "$ROOT/tools/production-transaction.py" inventory --repo "$ROOT" --root /
     ;;
   --apply)
     echo 'BLOCKED: v1.2 is a release candidate, not a tested full installer.' >&2
