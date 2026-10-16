@@ -34,6 +34,35 @@ class RecoveryFixtureTests(unittest.TestCase):
             self.assertEqual((dst / "untouched").read_text(), "keep")
             self.assertFalse((root / rec.JOURNAL).exists())
 
+    def test_corrupt_journal_rejected_without_restoration(self):
+        import json
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp)
+            _, dst = self.fixture(root)
+            rec.prepare(root)
+            rec.apply_partial(root, 1)
+            journal = root / rec.JOURNAL / "manifest.json"
+            data = json.loads(journal.read_text())
+            data["entries"][1]["name"] = data["entries"][0]["name"]
+            journal.write_text(json.dumps(data))
+            with self.assertRaises(ValueError):
+                rec.recover(root)
+            self.assertEqual((dst / "a").read_text(), "new a")
+            self.assertTrue((root / rec.JOURNAL).exists())
+
+    def test_bad_journal_id_rejected(self):
+        import json
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            root = Path(tmp)
+            self.fixture(root)
+            rec.prepare(root)
+            journal = root / rec.JOURNAL / "manifest.json"
+            data = json.loads(journal.read_text())
+            data["entries"][0]["id"] = "../escape"
+            journal.write_text(json.dumps(data))
+            with self.assertRaises(ValueError):
+                rec.recover(root)
+
     def test_unmarked_directory_refused(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
             with self.assertRaises(ValueError):
