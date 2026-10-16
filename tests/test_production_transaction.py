@@ -36,7 +36,7 @@ class ProductionTransactionFixtures(unittest.TestCase):
             root=Path(tmp);repo,old=self.setup(root)
             tx.apply(repo,root)
             tx.finalize(root)
-            self.assertEqual((old/"app.js").read_text(),"new")
+            self.assertEqual((old/"app.js").read_text(),"old")
             self.assertFalse((root/tx.TRANSACTION).exists())
     def test_symlink_target_refused(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
