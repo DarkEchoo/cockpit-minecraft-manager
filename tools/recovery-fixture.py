@@ -6,6 +6,7 @@ recover invocation uses those originals even after the writer exits. This
 does not yet guarantee power-loss atomicity across a filesystem.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,13 @@ def checked(root):
     if p.is_symlink() or not p.is_dir() or not (p / MARKER).is_file():
         raise ValueError("Missing valid fixture marker")
     return p
+
+def sha256_file(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for part in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(part)
+    return h.hexdigest()
 
 def ensure_regular(p):
     st = p.lstat()
@@ -73,7 +81,8 @@ def prepare(root):
             with open(backups / str(n), "rb") as f: os.fsync(f.fileno())
         shutil.copy2(src / name, staged / str(n))
         with open(staged / str(n), "rb") as f: os.fsync(f.fileno())
-        entries.append({"name": name, "id": n, "existed": prior})
+        entries.append({"name": name, "id": n, "existed": prior,
+                        "backup_sha256": sha256_file(backups / str(n)) if prior else None})
     fsync_dir(backups)
     fsync_dir(staged)
     atomic_json(txn / "manifest.json", {"format": 1, "entries": entries, "state": "prepared"})
@@ -118,6 +127,13 @@ def recover(root):
             raise ValueError("Invalid or duplicate journal ID")
         if type(existed) is not bool:
             raise ValueError("Invalid journal prior-state flag")
+        expected = entry.get("backup_sha256")
+        if existed:
+            if (not isinstance(expected, str) or len(expected) != 64 or
+                    any(char not in "0123456789abcdef" for char in expected)):
+                raise ValueError("Invalid backup digest in journal")
+        elif expected is not None:
+            raise ValueError("Unexpected digest for newly created file")
         seen_names.add(name)
         seen_ids.add(number)
         target = root / "installed" / name
@@ -126,6 +142,15 @@ def recover(root):
         if entry["existed"]:
             prior = txn / "backups" / str(entry["id"])
             if not prior.is_file() or prior.is_symlink(): raise ValueError("Missing recovery backup")
+            ensure_regular(prior)
+            if sha256_file(prior) != entry["backup_sha256"]:
+                raise ValueError("Recovery backup digest mismatch")
+    # Validate every temporary restore path before ANY destination change.
+    for entry in entries:
+        if entry["existed"]:
+            temp = root / "installed" / (".mc-restore-" + str(entry["id"]) + ".tmp")
+            if temp.is_symlink() or temp.exists():
+                raise ValueError("Unexpected restoration temporary path")
     for entry in reversed(entries):
         target = root / "installed" / entry["name"]
         if entry["existed"]:
@@ -133,8 +158,6 @@ def recover(root):
             # Keep the original backup intact until ALL recovery steps finish.
             # A subsequent recover() can replay an interrupted restore.
             temp = target.with_name(".mc-restore-" + str(entry["id"]) + ".tmp")
-            if temp.is_symlink() or temp.exists():
-                raise ValueError("Unexpected restoration temporary path")
             shutil.copy2(prior, temp)
             with open(temp, "rb") as handle:
                 os.fsync(handle.fileno())
