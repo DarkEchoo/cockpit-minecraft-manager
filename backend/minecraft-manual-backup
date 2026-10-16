@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Opt-in, host-configured Minecraft manual restic backup.
+# No default server, drive, password, or service is assumed.
+set -Eeuo pipefail
+CONFIG="${MC_MANUAL_BACKUP_CONFIG:-/etc/minecraft-backup/manual-backup.conf}"
+if [[ ! -f "$CONFIG" || -L "$CONFIG" ]]; then
+  echo "Missing safe backup configuration: $CONFIG" >&2
+  exit 2
+fi
+# The configuration is root-controlled and should contain only shell assignments.
+if [[ "$(id -u)" != 0 ]]; then echo 'Run backup as root' >&2; exit 2; fi
+if [[ "$(stat -c %u "$CONFIG")" != 0 ]] || (( (8#$(stat -c %a "$CONFIG") & 8#022) != 0 )); then
+  echo 'Configuration must be root-owned and not group/world writable' >&2
+  exit 2
+fi
+# shellcheck disable=SC1090
+source "$CONFIG"
+: "${MC_BACKUP_MOUNT:?Configure MC_BACKUP_MOUNT}"
+: "${MC_BACKUP_UUID:?Configure MC_BACKUP_UUID}"
+: "${MC_BACKUP_REPO:?Configure MC_BACKUP_REPO}"
+: "${MC_BACKUP_PASSWORD_FILE:?Configure MC_BACKUP_PASSWORD_FILE}"
+: "${MC_BACKUP_SOURCE:?Configure MC_BACKUP_SOURCE}"
+: "${MC_BACKUP_SERVICE:?Configure MC_BACKUP_SERVICE}"
+[[ -d "$MC_BACKUP_SOURCE" && -r "$MC_BACKUP_PASSWORD_FILE" && -f "$MC_BACKUP_REPO/config" ]] || {
+  echo 'Backup prerequisites missing' >&2; exit 2;
+}
+[[ "$(findmnt -rn -M "$MC_BACKUP_MOUNT" -o UUID)" == "$MC_BACKUP_UUID" ]] || {
+  echo 'Refusing to back up: expected drive UUID is not mounted' >&2; exit 2;
+}
+[[ ",$(findmnt -rn -M "$MC_BACKUP_MOUNT" -o OPTIONS)," == *,rw,* ]] || {
+  echo 'Refusing to back up: destination is not writable' >&2; exit 2;
+}
+exec 9>/run/lock/minecraft-manual-backup.lock
+flock -n 9 || { echo 'Backup already in progress' >&2; exit 1; }
+# Explicit opt-in is required before interrupting a server.
+if [[ "${MC_BACKUP_ALLOW_STOP:-no}" != yes ]]; then
+  echo 'Backup would require a service stop; MC_BACKUP_ALLOW_STOP=yes is required' >&2
+  exit 2
+fi
+systemctl is-active --quiet "$MC_BACKUP_SERVICE" || {
+  echo 'Server is not running; refusing to change its state' >&2; exit 2;
+}
+stopped=0
+cleanup() {
+  status=$?
+  trap - EXIT
+  if (( stopped )); then
+    systemctl start "$MC_BACKUP_SERVICE" || status=1
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+stopped=1
+systemctl stop "$MC_BACKUP_SERVICE"
+if systemctl is-active --quiet "$MC_BACKUP_SERVICE"; then
+  echo 'Service failed to stop; backup aborted' >&2; exit 1
+fi
+restic --repo "$MC_BACKUP_REPO" --password-file "$MC_BACKUP_PASSWORD_FILE" backup "$MC_BACKUP_SOURCE" --tag minecraft-manual

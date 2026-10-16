@@ -2,9 +2,26 @@
 
 A self-hosted Minecraft server-management interface for [Cockpit](https://cockpit-project.org/) on Linux, under active development.
 
-> **Development snapshot — not a ready-to-install release.** The source here is a sanitized snapshot of the existing manager. Some advanced features call additional local helper programs that are **not included**, and the code assumes Linux services and backup configuration exist. Do not run it on an unprotected production server without reviewing the code and dependencies.
+> **v1.2 release candidate.** The unified installer supports an explicit opt-in file-only transaction with rollback, but has not yet passed final validation on a disposable Ubuntu host and the existing production installation. Advanced tools require per-host services, mounts, users and configuration. Do not install on a critical system without reviewing the change plan and keeping an independent backup.
 
-## Current functionality in the uploaded snapshot
+## Screenshots
+
+A tour of the current Cockpit Minecraft Manager interface. Select an image to view it full size. Some server labels and paths shown are examples from the development environment.
+
+<a href="docs/screenshots/OverviewPage.png"><img src="docs/screenshots/OverviewPage.png" alt="Overview page" width="48%"></a>
+<a href="docs/screenshots/FilePage.png"><img src="docs/screenshots/FilePage.png" alt="Files page" width="48%"></a>
+<a href="docs/screenshots/BackupPage.png"><img src="docs/screenshots/BackupPage.png" alt="Backups page" width="48%"></a>
+<a href="docs/screenshots/PlayersPage.png"><img src="docs/screenshots/PlayersPage.png" alt="Players page" width="48%"></a>
+<a href="docs/screenshots/AdvancedControlCenterPage.png"><img src="docs/screenshots/AdvancedControlCenterPage.png" alt="Advanced Control page" width="48%"></a>
+<a href="docs/screenshots/PlayerRecordsAndStoragePage.png"><img src="docs/screenshots/PlayerRecordsAndStoragePage.png" alt="Player Records & Storage page" width="48%"></a>
+<a href="docs/screenshots/PerformancePage.png"><img src="docs/screenshots/PerformancePage.png" alt="Performance page" width="48%"></a>
+<a href="docs/screenshots/RestartsAndResourcesPage.png"><img src="docs/screenshots/RestartsAndResourcesPage.png" alt="Restarts & Resources page" width="48%"></a>
+<a href="docs/screenshots/CreateServerPage.png"><img src="docs/screenshots/CreateServerPage.png" alt="Create Server page" width="48%"></a>
+<a href="docs/screenshots/ModPackPage.png"><img src="docs/screenshots/ModPackPage.png" alt="Modpacks page" width="48%"></a>
+
+See the [complete screenshot gallery](docs/SCREENSHOTS.md).
+
+## Current console functionality
 
 - Browse and control independent managed Minecraft servers.
 - Create Vanilla, Spigot, Paper, and Purpur instances (subject to upstream availability).
@@ -29,7 +46,17 @@ A self-hosted Minecraft server-management interface for [Cockpit](https://cockpi
 
 ## Installation
 
-No public one-click installer is supplied in this development snapshot. The full deployed setup depends on other helpers, service users, systemd units, external programs, and private settings. First test changes on a disposable Linux VM and review privilege boundaries.
+The installer finds its files relative to its own location, so you can run it from Downloads or another extracted directory (keep the complete folder intact). Cockpit must already be installed and active.\n\n```bash\nbash "/path/to/extracted/install.sh" --check --host\nsudo bash "/path/to/extracted/install.sh" --plan\n```\n\nSee [installation, recovery, and limitations](docs/INSTALL_V12.md) for the gated install, rollback and finalization commands. The installer does not modify existing systemd units, timers, world data, backup mounts or credentials.
+
+### Run from any download location
+
+The installer finds its project files relative to its own location; your working directory does not matter. Extract the **entire** release archive (not just `install.sh`) and invoke the script by its path:
+
+```bash
+bash "/path/to/extracted release/install.sh" --check
+```
+
+The v1.2 development branch currently supports read-only checks only. `--apply` is deliberately blocked until production upgrade and rollback validation is complete.
 
 ## Security and privacy
 
@@ -41,7 +68,7 @@ Personal, non-commercial educational project. Public GitHub repository is intend
 
 ## License
 
-No open-source license has been selected yet. Until one is added, the repository should not be assumed to permit reuse or redistribution.
+This repository uses a [proprietary source-available license](LICENSE); it is not open source. Official unmodified releases can be downloaded, installed and evaluated privately as specified in that license.
 
 
 > **Development-source warning:** This review snapshot includes all 11 examined Python helpers but is not a complete tested installer. Before any public release, verify runtime dependencies, credential handling, systemd units, platform portability, and all Git history. See `docs/AUDIT_REVIEW.md`.

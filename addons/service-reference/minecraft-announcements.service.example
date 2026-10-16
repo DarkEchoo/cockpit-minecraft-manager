@@ -1,0 +1,12 @@
+# Reference template ONLY. Do not enable automatically. Review system user and host paths.
+[Unit]
+Description=Cockpit Minecraft periodic announcement tick
+After=local-fs.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/cockpit-minecraft-announcements tick
+User=root
+Group=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
