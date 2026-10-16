@@ -19,6 +19,7 @@ COMPONENTS = {
     "backend": ("backend", "libexec"),
     "backup_helpers": ("addons/backup-manager/helpers", "libexec"),
     "backup_units_templates": ("addons/backup-manager/systemd", "templates/systemd"),
+    "optional_service_templates": ("addons/service-reference", "templates/service-reference"),
 }
 # The backup schedule UI is already part of the unified frontend.
 REQUIRED = {
@@ -28,6 +29,8 @@ REQUIRED = {
     "backend": ("cockpit-minecraft-helper", "cockpit-minecraft-modpack-audit", "minecraft-default-proxy", "minecraft-join-announcer", "minecraft-manual-backup"),
     "backup_helpers": ("mc_backup_config.py", "cockpit-mc-snapshot", "cockpit-mc-schedule",
                        "cockpit-minecraft-backup", "cockpit-minecraft-backup-center"),
+    "optional_service_templates": ("minecraft-backup.service.example", "minecraft-default-port.service.example",
+                                   "minecraft-join-announcer.service.example"),
     "backup_units_templates": ("cockpit-mc-snapshot@.service.in",
                                "cockpit-mc-snapshot@.timer"),
 }
