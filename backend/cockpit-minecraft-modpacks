@@ -348,6 +348,91 @@ def inventory(name):
     md=folder/'mods'
     return {'mods':sorted(p.name for p in md.iterdir() if p.is_file() and not p.is_symlink() and (p.name.endswith('.jar') or p.name.endswith('.jar.disabled'))) if md.is_dir() and not md.is_symlink() else []}
 
+# Read-only loader and Java compatibility checks restored from live-console API.
+def _loader_version(version):
+    if not isinstance(version,str) or not re.fullmatch(r'[0-9][A-Za-z0-9._-]{0,39}',version):
+        raise ValueError('Invalid loader or Minecraft version')
+    return version
+
+def _fabric_json(path):
+    host='meta.fabricmc.net'
+    request=urllib.request.Request('https://'+host+'/v2/versions/'+path,headers={'User-Agent':'CockpitMinecraftManager/0.3','Accept':'application/json'})
+    with urllib.request.urlopen(request,timeout=20) as response:
+        redirected=urllib.parse.urlparse(response.url)
+        if redirected.hostname!=host or redirected.scheme!='https':
+            raise ValueError('Unexpected Fabric metadata redirect')
+        data=response.read(8_388_609)
+    if len(data)>8_388_608:raise ValueError('Fabric metadata exceeds 8 MiB safety limit')
+    return json.loads(data)
+
+def loader_plan(name):
+    folder,meta=load(name)
+    loader=meta.get('loader','').lower()
+    game=_loader_version(meta.get('minecraft_version',''))
+    if loader not in ('fabric','quilt','neoforge','forge'):
+        raise ValueError('Choose a supported loader in a custom manifest')
+    if meta.get('status')!='custom-manifest-only':
+        raise ValueError('Planning is only available for unprovisioned custom workspaces')
+    instructions={
+      'fabric':'Use stage-fabric to download a pinned official Fabric server launcher; it may fetch dependencies at first start.',
+      'quilt':'Quilt installer execution is disabled; review the official version-matched installer separately.',
+      'neoforge':'NeoForge installer execution is disabled; review version-matched Java arguments separately.',
+      'forge':'Forge installer execution is disabled; review version-matched launch arguments separately.'
+    }
+    result={'workspace':name,'loader':loader,'minecraft_version':game,'status':'planning-only',
+            'message':instructions[loader],'changes_made':False}
+    if loader=='fabric':
+        versions=_fabric_json('loader/'+urllib.parse.quote(game,safe=''))
+        installers=_fabric_json('installer')
+        stable_loaders=[x['loader']['version'] for x in versions if isinstance(x,dict) and x.get('loader',{}).get('stable') and x.get('loader',{}).get('version')]
+        stable_installers=[x['version'] for x in installers if isinstance(x,dict) and x.get('stable') and x.get('version')]
+        result['available_loader_versions']=stable_loaders[:10]
+        result['available_installer_versions']=stable_installers[:5]
+        result['can_stage']=bool(stable_loaders and stable_installers)
+    return result
+
+def _installed_java_major():
+    p=subprocess.run(['java','-version'],capture_output=True,text=True,timeout=8)
+    output=p.stderr+'\n'+p.stdout
+    match=re.search(r'version "(\d+)(?:[."]|$)',output)
+    if p.returncode or not match:raise ValueError('Cannot determine installed Java version')
+    major=int(match.group(1))
+    if major==1:
+        legacy=re.search(r'version "1\.(\d+)',output)
+        if legacy:major=int(legacy.group(1))
+    return major
+
+def _required_java_major(version):
+    m=re.fullmatch(r'(\d+)\.(\d+)(?:\.(\d+))?',version)
+    if not m:return None
+    major,minor,patch=(int(m.group(1)),int(m.group(2)),int(m.group(3) or 0))
+    if major>=26:return 21
+    if major!=1:return None
+    if minor>=21:return 21
+    if minor==20 and patch>=5:return 21
+    if minor>=18:return 17
+    if minor>=17:return 16
+    if minor>=16:return 8
+    return None
+
+def deployment_preflight(name):
+    folder,meta=load(name)
+    jar=folder/'server.jar'
+    checks={'staged':meta.get('status')=='staged-server-files',
+      'jar_present':jar.is_file() and not jar.is_symlink() and zipfile.is_zipfile(jar),
+      'service_not_registered':name not in registry(),
+      'service_unit_available':not (UNITROOT/service(name)).exists(),
+      'minecraft_user_exists':False,'java_major':None,
+      'java_required_minimum':_required_java_major(str(meta.get('minecraft_version','')))}
+    try:pwd.getpwnam('minecraft');checks['minecraft_user_exists']=True
+    except KeyError:pass
+    try:checks['java_major']=_installed_java_major()
+    except Exception:pass
+    checks['java_compatible']=bool(checks['java_major'] and checks['java_required_minimum'] and checks['java_major']>=checks['java_required_minimum'])
+    checks['ready']=all(checks[k] for k in ('staged','jar_present','service_not_registered','service_unit_available','minecraft_user_exists','java_compatible'))
+    checks['note']='Requires explicit EULA acceptance; loader compatibility and dependencies not guaranteed. Server remains stopped.'
+    return checks
+
 def main(args):
     if not args:raise ValueError('Operation required')
     op,*a=args
@@ -355,6 +440,8 @@ def main(args):
     if op=='search' and len(a)==3:return query(*a)
     if op=='files' and len(a)==1:return cf_files(a[0])
     if op=='create-manifest' and len(a)==3:return new_manifest(*a)
+    if op=='loader-plan' and len(a)==1:return loader_plan(a[0])
+    if op=='preflight' and len(a)==1:return deployment_preflight(a[0])
     if op=='import' and len(a)==2:
         raw=sys.stdin.buffer.read(MAX_ARCHIVE+1)
         return import_zip(a[0],a[1],raw)
