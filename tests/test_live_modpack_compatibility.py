@@ -4,7 +4,8 @@ import unittest
 from unittest.mock import patch
 
 SOURCE=Path(__file__).resolve().parents[1]/"backend/cockpit-minecraft-modpacks"
-spec=importlib.util.spec_from_file_location("mc_modpacks",SOURCE)
+from importlib.machinery import SourceFileLoader
+spec=importlib.util.spec_from_loader("mc_modpacks", SourceFileLoader("mc_modpacks", str(SOURCE)))
 mod=importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 
