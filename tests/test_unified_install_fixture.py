@@ -29,6 +29,30 @@ class UnifiedInstallFixtureTests(unittest.TestCase):
    with self.assertRaises(RuntimeError):
     mod.install_fixture(SCRIPT.parents[1],root,fail_after=8)
    self.assertEqual((old/"app.js").read_text(),"original")
+ def test_symlink_parent_is_refused(self):
+  with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+   root=Path(tmp)
+   self.fixture(root)
+   (root/"installed/libexec").symlink_to(root/"installed/share",target_is_directory=True)
+   with self.assertRaisesRegex(ValueError,"Symlink"):
+    mod.install_fixture(SCRIPT.parents[1],root)
+ def test_copy_failure_rolls_back_in_progress_file(self):
+  from unittest.mock import patch
+  with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+   root=Path(tmp)
+   old=self.fixture(root)
+   original=mod.shutil.copy2
+   fired=[False]
+   def broken(src,dst,*args,**kwargs):
+    if str(dst).endswith("/app.js") and not fired[0]:
+     fired[0]=True
+     Path(dst).write_text("partial write")
+     raise OSError("injected copy failure")
+    return original(src,dst,*args,**kwargs)
+   with patch.object(mod.shutil,"copy2",side_effect=broken):
+    with self.assertRaises(OSError):
+     mod.install_fixture(SCRIPT.parents[1],root)
+   self.assertEqual((old/"app.js").read_text(),"original")
  def test_requires_fixture_marker(self):
   with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
    root=Path(tmp)
