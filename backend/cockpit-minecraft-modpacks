@@ -391,6 +391,63 @@ def loader_plan(name):
         result['can_stage']=bool(stable_loaders and stable_installers)
     return result
 
+def stage_fabric(name,loader_version,installer_version):
+    """Stage official Fabric server launcher only; never start a server."""
+    folder,meta=load(name)
+    if meta.get('loader')!='fabric' or meta.get('status')!='custom-manifest-only':
+        raise ValueError('Requires an unprovisioned Fabric custom workspace')
+    if registry().get(name):raise ValueError('Workspace already registered')
+    safety_path(folder)
+    if (folder/'server.jar').exists() or (folder/'server.jar').is_symlink():
+        raise ValueError('server.jar already exists; refusing overwrite')
+    game=_loader_version(meta.get('minecraft_version',''))
+    lv=_loader_version(loader_version)
+    iv=_loader_version(installer_version)
+    versions=_fabric_json('loader/'+urllib.parse.quote(game,safe=''))
+    installers=_fabric_json('installer')
+    if not any(x.get('loader',{}).get('version')==lv and x.get('loader',{}).get('stable') for x in versions):
+        raise ValueError('Fabric loader not stable for this Minecraft version')
+    if not any(x.get('version')==iv and x.get('stable') for x in installers):
+        raise ValueError('Fabric installer not stable')
+    host='meta.fabricmc.net'
+    path='/v2/versions/loader/'+urllib.parse.quote(game,safe='')+'/'+urllib.parse.quote(lv,safe='')+'/'+urllib.parse.quote(iv,safe='')+'/server/jar'
+    req=urllib.request.Request('https://'+host+path,headers={'User-Agent':'CockpitMinecraftManager/0.3'})
+    temp=folder/'.fabric-launcher-partial.jar'
+    if temp.exists() or temp.is_symlink():raise ValueError('Previous partial download exists')
+    digest=hashlib.sha256();size=0
+    try:
+        with urllib.request.urlopen(req,timeout=60) as response:
+            redirect=urllib.parse.urlparse(response.url)
+            if redirect.scheme!='https' or redirect.hostname!=host:
+                raise ValueError('Unexpected Fabric launcher redirect')
+            with temp.open('xb') as output:
+                while True:
+                    chunk=response.read(1024*1024)
+                    if not chunk:break
+                    size+=len(chunk)
+                    if size>25*1024*1024:raise ValueError('Fabric launcher exceeds 25 MiB')
+                    digest.update(chunk);output.write(chunk)
+                output.flush();os.fsync(output.fileno())
+        if size<1024 or not zipfile.is_zipfile(temp):
+            raise ValueError('Downloaded file is not a valid launcher JAR')
+        with zipfile.ZipFile(temp) as jar:
+            if jar.testzip() is not None or 'META-INF/MANIFEST.MF' not in jar.namelist():
+                raise ValueError('Corrupt launcher JAR or missing manifest')
+        temp.replace(folder/'server.jar')
+        meta['status']='staged-server-files'
+        meta['loader_version']=lv;meta['installer_version']=iv
+        meta['launcher_sha256']=digest.hexdigest()
+        meta['launcher_source']='https://'+host+path
+        meta['warnings']=['Official Fabric launcher staged; it may download dependencies when started.',
+                          'Review mods and Java compatibility before deployment.',
+                          'No Minecraft service was created or started.']
+        save(folder,meta)
+        return {'workspace':name,'status':meta['status'],'loader':'fabric',
+                'minecraft_version':game,'loader_version':lv,'installer_version':iv,
+                'sha256':digest.hexdigest(),'bytes':size,'service_created':False,'server_started':False}
+    finally:
+        if temp.exists():temp.unlink()
+
 def _installed_java_major():
     p=subprocess.run(['java','-version'],capture_output=True,text=True,timeout=8)
     output=p.stderr+'\n'+p.stdout
@@ -442,6 +499,7 @@ def main(args):
     if op=='create-manifest' and len(a)==3:return new_manifest(*a)
     if op=='loader-plan' and len(a)==1:return loader_plan(a[0])
     if op=='preflight' and len(a)==1:return deployment_preflight(a[0])
+    if op=='stage-fabric' and len(a)==3:return stage_fabric(*a)
     if op=='import' and len(a)==2:
         raw=sys.stdin.buffer.read(MAX_ARCHIVE+1)
         return import_zip(a[0],a[1],raw)
