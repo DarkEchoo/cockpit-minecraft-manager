@@ -24,10 +24,16 @@ jobs:
           from pathlib import Path
           for directory in ("backend", "addons/backup-manager/helpers", "tools", "tests"):
               for path in Path(directory).iterdir():
-                  if path.is_file() and not path.name.startswith(".") and (path.suffix == ".py" or (path.parent.name in ("backend", "helpers") and path.suffix == "")):
+                  if path.is_file() and not path.name.startswith(".") and (path.suffix == ".py" or (path.parent.name in ("backend", "helpers") and path.suffix == "" and path.read_bytes().startswith(b"#!/usr/bin/env python"))):
                       ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
           print("Python syntax verified")
           PY
+      - name: Shell script syntax
+        run: |
+          find backend addons/backup-manager/helpers -type f -print0 | while IFS= read -r -d "" file; do
+            if head -n1 "$file" | grep -Eq "^#!.*(bash|/sh)"; then bash -n "$file"; fi
+          done
+          bash -n install.sh
       - name: Frontend JavaScript syntax
         run: |
           for file in cockpit/minecraft-manager/*.js addons/backup-manager/cockpit/*.js; do
