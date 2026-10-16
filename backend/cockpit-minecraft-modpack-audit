@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""Read-only Minecraft modpack inventory and update preflight. No network, writes, or starts."""
+import argparse, json, pathlib, re, sys, zipfile, hashlib, os
+ROOT=pathlib.Path('/opt/minecraft/modpack-workspaces')
+MOD_ID=re.compile(r'^[a-z][a-z0-9_-]{1,127}$')
+NAME=re.compile(r'^[a-z][a-z0-9-]{1,34}$')
+MAX_JAR=256*1024*1024
+MAX_META=262144
+
+def workspace(name):
+    if not NAME.fullmatch(name): raise ValueError('Invalid workspace ID')
+    root=ROOT.resolve(strict=True)
+    folder=root/name
+    if folder.is_symlink() or not folder.is_dir() or folder.resolve()!=folder or folder.parent!=root: raise ValueError('Invalid workspace path')
+    return folder
+
+def json_file(p):
+    if p.is_symlink() or not p.is_file() or p.stat().st_size>MAX_META: raise ValueError('Invalid metadata file')
+    return json.loads(p.read_text())
+
+def zip_read(z,name):
+    try: info=z.getinfo(name)
+    except KeyError: return None
+    if info.file_size>MAX_META: return None
+    return z.read(info).decode('utf-8','replace')
+
+def analyze_jar(path):
+    result={'file':path.name,'bytes':path.stat().st_size,'ids':[],'dependencies':[], 'warnings':[]}
+    if path.is_symlink() or not path.is_file() or path.stat().st_size>MAX_JAR:
+        result['warnings'].append('Unsafe or oversized JAR; not opened');return result
+    if not zipfile.is_zipfile(path):
+        result['warnings'].append('Invalid JAR archive');return result
+    try:
+        with zipfile.ZipFile(path) as z:
+            raw=zip_read(z,'fabric.mod.json')
+            if raw:
+                try:
+                    doc=json.loads(raw)
+                    ids=[doc.get('id')]
+                    result['ids']=[x for x in ids if isinstance(x,str) and MOD_ID.fullmatch(x)]
+                    result['loader']='fabric-compatible'
+                    deps=doc.get('depends',{})
+                    if isinstance(deps,dict):
+                        result['dependencies']=[{'id':k,'constraint':str(v)[:200], 'kind':'required'} for k,v in deps.items() if MOD_ID.fullmatch(k)]
+                    elif isinstance(deps,list):
+                        result['warnings'].append('Unexpected Fabric depends format')
+                except (ValueError,TypeError):result['warnings'].append('Invalid fabric.mod.json')
+            for member in ('META-INF/mods.toml','META-INF/neoforge.mods.toml'):
+                raw=zip_read(z,member)
+                if raw:
+                    result['loader']='forge-family'
+                    try:
+                        import tomllib
+                        d=tomllib.loads(raw)
+                        for m in d.get('mods',[]):
+                            mid=m.get('modId')
+                            if isinstance(mid,str) and MOD_ID.fullmatch(mid):result['ids'].append(mid)
+                        for name,records in d.get('dependencies',{}).items():
+                            if not isinstance(records,list):continue
+                            for dep in records:
+                                mid=dep.get('modId')
+                                if isinstance(mid,str) and MOD_ID.fullmatch(mid) and (dep.get('mandatory',False) or dep.get('type')=='required'):
+                                    result['dependencies'].append({'id':mid,'constraint':str(dep.get('versionRange',''))[:200], 'kind':'required'})
+                    except (ValueError,TypeError,AttributeError):result['warnings'].append('Cannot parse Forge-family metadata')
+            if not result['ids']:result['warnings'].append('No recognized mod ID; may be a library or unknown loader')
+    except (OSError,zipfile.BadZipFile):result['warnings'].append('JAR unreadable')
+    result['ids']=list(dict.fromkeys(result['ids']))
+    return result
+
+def inventory(name):
+    folder=workspace(name)
+    meta=json_file(folder/'modpack.json')
+    moddir=folder/'mods'
+    if moddir.is_symlink():raise ValueError('Symlink mods directory refused')
+    files=[]
+    if moddir.is_dir():
+        for p in sorted(moddir.iterdir()):
+            if p.name.endswith('.jar') or p.name.endswith('.jar.disabled'):
+                if p.name.endswith('.disabled'):
+                    files.append({'file':p.name,'enabled':False});continue
+                item=analyze_jar(p);item['enabled']=True;files.append(item)
+    ids={i for f in files if f.get('enabled') for i in f.get('ids',[])}
+    builtins={'minecraft','java','fabricloader','forge','neoforge','quilt_loader'}
+    missing=[]
+    for f in files:
+        if not f.get('enabled'):continue
+        for dep in f.get('dependencies',[]):
+            if dep['id'] not in ids and dep['id'] not in builtins:
+                missing.append({'file':f['file'],'dependency':dep['id'],'constraint':dep['constraint']})
+    return {'workspace':name,'minecraft_version':meta.get('minecraft_version'), 'loader':meta.get('loader'),
+            'status':meta.get('status'), 'mods':files,'possibly_missing_dependencies':missing,
+            'note':'Static metadata inspection only; version constraints, embedded JARs, client-only mods and conflicts are not fully validated.'}
+
+def preview(name,candidate):
+    report=inventory(name)
+    target=pathlib.Path(candidate)
+    if target.is_symlink() or not target.is_file() or target.stat().st_size>1024*1024*1024:raise ValueError('Candidate must be an ordinary ZIP <=1 GiB')
+    if not zipfile.is_zipfile(target):raise ValueError('Candidate is not ZIP')
+    with zipfile.ZipFile(target) as z:
+        infos=z.infolist()
+        if len(infos)>30000:raise ValueError('Too many archive entries')
+        total=0;names=[]
+        for i in infos:
+            p=pathlib.PurePosixPath(i.filename)
+            if p.is_absolute() or '..' in p.parts or '\\' in i.filename or ':' in i.filename or i.filename.startswith('//'):
+                raise ValueError('Unsafe ZIP path')
+            mode=(i.external_attr>>16)&0o170000
+            if mode==0o120000:raise ValueError('Symlink in archive')
+            total+=i.file_size
+            if total>3*1024*1024*1024:raise ValueError('Expanded ZIP exceeds 3 GiB')
+            if not i.is_dir():names.append(i.filename)
+    current=set(x['file'] for x in report['mods'])
+    proposed=set(pathlib.PurePosixPath(x).name for x in names if x.startswith('mods/') and x.endswith('.jar') and len(pathlib.PurePosixPath(x).parts)==2)
+    return {'workspace':name,'candidate_sha256':digest(target),'candidate_entries':len(names),
+            'jars_added':sorted(proposed-current),'jars_removed':sorted(current-proposed),
+            'has_server_jar':'server.jar' in names,'has_manifest':'manifest.json' in names,
+            'would_modify_live_server':False, 'ready_to_apply':False,
+            'blockers':['No update is applied by this tool','A successful off-host or full snapshot, stopped service, loader compatibility verification, and user confirmation are required before any update'],
+            'note':'This is a file-name comparison, not permission to install or replace any existing server.'}
+
+def digest(path):
+    h=hashlib.sha256()
+    with path.open('rb') as f:
+        for chunk in iter(lambda:f.read(1024*1024),b''):h.update(chunk)
+    return h.hexdigest()
+
+def loader_guidance(name):
+    folder=workspace(name)
+    meta=json_file(folder/'modpack.json')
+    loader=meta.get('loader')
+    recipes={
+      'fabric':{'distribution':'Fabric official server launcher','launcher':'version-pinned server.jar','note':'A staged launcher is not evidence that first-run dependencies are present.'},
+      'forge':{'distribution':'MinecraftForge official installer','launcher':'installer-generated run.sh or supported argument-file launch','note':'Do not invoke downloaded installers automatically. Needs exact loader/MC pairing.'},
+      'neoforge':{'distribution':'NeoForge official installer','launcher':'installer-generated run.sh or supported argument-file launch','note':'Do not assume java -jar installer.jar starts a server.'},
+      'quilt':{'distribution':'Quilt official installer','launcher':'version-specific server-launch artifacts','note':'Use official version metadata and verify launch semantics before provisioning.'}}
+    if loader not in recipes:raise ValueError('Unknown loader')
+    return {'workspace':name,'loader':loader,'minecraft_version':meta.get('minecraft_version'),
+            'recommended_process':recipes[loader], 'installation_enabled':False,
+            'service_or_world_changed':False,
+            'next_checks':['Obtain artifacts from official vendor','Verify hashes/signatures where available','Check Java and EULA','Provision as minecraft user in new workspace','Validate launch command without running active servers']}
+
+def update_readiness(name):
+    report=inventory(name)
+    folder=workspace(name)
+    unsafe=[]
+    if report['status'] not in ('deployed-stopped','staged-server-files','custom-manifest-only'):
+        unsafe.append('Unrecognized workspace status')
+    if report['possibly_missing_dependencies']:
+        unsafe.append('Potential dependencies missing')
+    service='mc-managed-'+name+'.service'
+    import subprocess
+    state=subprocess.run(['systemctl','is-active',service],capture_output=True,text=True,timeout=8).stdout.strip()
+    if state not in ('inactive','unknown','failed'):
+        unsafe.append('Service state is '+state+'; stop before any update')
+    if folder.joinpath('mods').is_symlink():unsafe.append('Symlink mods directory')
+    return {'workspace':name,'systemd_state':state or 'unknown',
+            'suspected_missing_dependencies':len(report['possibly_missing_dependencies']),
+            'warnings':unsafe,'can_apply_update':False,
+            'required_gates':['Verified full snapshot on independent storage','Restore test performed','Exact loader/version compatibility verified','Explicit confirmation on a stopped server'],
+            'updates_applied':False,'note':'Read-only readiness report, NOT an update operation.'}
+
+
+def loader_source_plan(name):
+    """Non-executable source guidance. No downloads, signatures or versions asserted."""
+    folder=workspace(name)
+    meta=json_file(folder/'modpack.json')
+    loader=meta.get('loader')
+    sources={
+      'fabric':{'project':'Fabric','official_url':'https://fabricmc.net/use/server/', 'api':'https://meta.fabricmc.net/', 'artifact_kind':'Fabric server launcher'},
+      'forge':{'project':'Minecraft Forge','official_url':'https://files.minecraftforge.net/', 'api':'https://maven.minecraftforge.net/', 'artifact_kind':'Installer JAR; outputs must be inspected'},
+      'neoforge':{'project':'NeoForge','official_url':'https://neoforged.net/', 'api':'https://maven.neoforged.net/releases/net/neoforged/neoforge/', 'artifact_kind':'Installer JAR; generated launch script/args'},
+      'quilt':{'project':'Quilt','official_url':'https://quiltmc.org/en/install/server/', 'api':'https://meta.quiltmc.org/', 'artifact_kind':'Quilt server launcher / installer'}
+    }
+    if loader not in sources:raise ValueError('Unsupported loader')
+    return {'workspace':name,'minecraft_version':meta.get('minecraft_version'), 'loader':loader,
+            'source':sources[loader], 'metadata_checked_live':False,'exact_version_selected':False,
+            'download_performed':False,'installation_enabled':False,
+            'required_review':['Verify official version compatibility and release metadata',
+             'Require HTTPS and bounded downloads with SHA-256 provenance',
+             'Run installer only as minecraft user within a new isolated workspace',
+             'Inspect installer-generated launch command; do not assume java -jar',
+             'Keep the service stopped and disabled until explicitly approved'],
+            'note':'Official starting points only; no network validation or installation occurred.'}
+
+def backup_destination_plan(name,destination):
+    """Read-only filesystem/mount check; does not create or verify backup."""
+    import subprocess
+    folder=workspace(name)
+    raw=pathlib.Path(destination)
+    if not raw.is_absolute() or '..' in raw.parts:raise ValueError('Backup destination must be an absolute normalized path')
+    if raw.is_symlink() or not raw.is_dir():raise ValueError('Backup destination must exist as an ordinary directory')
+    full=raw.resolve(strict=True)
+    if full!=raw:raise ValueError('Symlinked backup path refused')
+    if full == folder or folder in full.parents or full in folder.parents:raise ValueError('Backup destination overlaps workspace')
+    def mount_info(p):
+        result=subprocess.run(['findmnt','-T',str(p),'-n','-o','SOURCE,TARGET,FSTYPE'], capture_output=True,text=True,timeout=8)
+        if result.returncode:raise ValueError('Unable to identify mount for '+str(p))
+        return result.stdout.strip()
+    source_mount=mount_info(folder);dest_mount=mount_info(full)
+    def mount_target(line):
+        parts=line.split();return parts[1] if len(parts)>=3 else ''
+    separate=bool(mount_target(source_mount) and mount_target(dest_mount) and mount_target(source_mount)!=mount_target(dest_mount))
+    return {'workspace':name,'backup_destination':str(full),'workspace_mount':source_mount,
+            'destination_mount':dest_mount,'distinct_mount_points':separate,
+            'backup_created':False,'restore_tested':False,'update_authorized':False,
+            'warnings':([] if separate else ['Backup destination is on the same mount point; not independent storage']),
+            'note':'A separate mount point alone does not guarantee independent physical storage. Verify hardware and an actual restore test before updates.'}
+
+def main():
+    p=argparse.ArgumentParser(description=__doc__)
+    subs=p.add_subparsers(dest='cmd',required=True)
+    a=subs.add_parser('audit');a.add_argument('workspace')
+    a=subs.add_parser('update-preview');a.add_argument('workspace');a.add_argument('candidate_zip')
+    a=subs.add_parser('loader-guidance');a.add_argument('workspace')
+    a=subs.add_parser('loader-source-plan');a.add_argument('workspace')
+    a=subs.add_parser('backup-destination-plan');a.add_argument('workspace');a.add_argument('destination')
+    a=subs.add_parser('update-readiness');a.add_argument('workspace')
+    args=p.parse_args()
+    if args.cmd=='audit':return inventory(args.workspace)
+    if args.cmd=='update-preview':return preview(args.workspace,args.candidate_zip)
+    if args.cmd=='loader-guidance':return loader_guidance(args.workspace)
+    if args.cmd=='loader-source-plan':return loader_source_plan(args.workspace)
+    if args.cmd=='backup-destination-plan':return backup_destination_plan(args.workspace,args.destination)
+    return update_readiness(args.workspace)
+
+if __name__=='__main__':
+    try:print(json.dumps({'ok':True,'data':main()},indent=2))
+    except Exception as e:
+        print(json.dumps({'ok':False,'error':str(e)[:500]},indent=2));sys.exit(1)
