@@ -45,7 +45,7 @@ jobs:
           assert not report["safe_to_install"]
           print("All packaged components present; production install remains gated")
           PY
-      - name: Ensure production apply is blocked
+      - name: Build unified release staging payload\n        run: |\n          python3 tools/build-release-stage.py --output /tmp/mc-v12-ci-stage\n          python3 - <<'PY'\n          import hashlib, json\n          from pathlib import Path\n          root = Path('/tmp/mc-v12-ci-stage')\n          manifest = json.loads((root / 'release-manifest.json').read_text())\n          assert manifest['files'] and not manifest['production_apply_enabled']\n          for item in manifest['files']:\n              assert hashlib.sha256((root / item['path']).read_bytes()).hexdigest() == item['sha256']\n          print('Staged payload checksum validation passed')\n          PY\n      - name: Ensure production apply is blocked
         run: |
           set +e
           bash install.sh --apply >/tmp/apply-out 2>&1
