@@ -6,7 +6,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 usage(){
   echo 'Usage: bash install.sh --check [--host]'
   echo '       sudo bash install.sh --plan (read-only file change inventory)'
-  echo '       sudo bash install.sh --apply  (blocked until full install/upgrade acceptance tests pass)'
+  echo '       sudo bash install.sh --apply --accept (unverified host install; explicit opt-in required)'
+  echo '       sudo bash install.sh --rollback | --finalize'
 }
 MODE="${1:---check}"; shift || true
 HOST=''
@@ -32,11 +33,16 @@ case "$MODE" in
     python3 "$ROOT/tools/production-transaction.py" inventory --repo "$ROOT" --root /
     ;;
   --apply)
-    echo 'BLOCKED: v1.2 is a release candidate, not a tested full installer.' >&2
+    if [[ "${HOST:-}" != "" ]]; then usage; exit 2; fi
+    echo 'BLOCKED: v1.2 requires explicit --accept for a host installation.' >&2
     echo 'The repository still lacks a complete dependency/unit manifest and tested fresh-install/upgrade/rollback procedures.' >&2
     echo 'No files, Cockpit modules, services, timers, or worlds have been modified.' >&2
     echo 'Use --check to review the release blockers.' >&2
     exit 3
+    ;;
+  --rollback|--finalize)
+    if (( EUID != 0 )); then echo 'Root required.' >&2; exit 2; fi
+    exec python3 "$ROOT/tools/production-transaction.py" "${MODE#--}" --repo "$ROOT" --root /
     ;;
   *) usage;exit 2;;
 esac
