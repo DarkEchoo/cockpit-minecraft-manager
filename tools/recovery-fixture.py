@@ -102,11 +102,24 @@ def recover(root):
     if txn.is_symlink() or not txn.is_dir(): raise ValueError("No transaction to recover")
     m = json.loads((txn / "manifest.json").read_text())
     if m.get("format") != 1 or m.get("state") != "prepared": raise ValueError("Invalid journal")
-    entries = m["entries"]
+    entries = m.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("Invalid journal entries")
+    seen_names, seen_ids = set(), set()
     for entry in entries:
-        name = entry["name"]
-        if not isinstance(name, str) or Path(name).name != name or name in (".", ".."):
-            raise ValueError("Invalid journal name")
+        if not isinstance(entry, dict):
+            raise ValueError("Invalid journal entry")
+        name, number, existed = entry.get("name"), entry.get("id"), entry.get("existed")
+        if (not isinstance(name, str) or not name or
+                Path(name).name != name or name in (".", "..") or
+                name in seen_names):
+            raise ValueError("Invalid or duplicate journal name")
+        if type(number) is not int or number < 0 or number in seen_ids:
+            raise ValueError("Invalid or duplicate journal ID")
+        if type(existed) is not bool:
+            raise ValueError("Invalid journal prior-state flag")
+        seen_names.add(name)
+        seen_ids.add(number)
         target = root / "installed" / name
         if target.is_symlink() or (target.exists() and not target.is_file()):
             raise ValueError("Unsafe recovery target")
