@@ -42,7 +42,9 @@ case "$MODE" in
     ;;
   --rollback|--finalize)
     if (( EUID != 0 )); then echo 'Root required.' >&2; exit 2; fi
-    exec python3 "$ROOT/tools/production-transaction.py" "${MODE#--}" --repo "$ROOT" --root /
+    ACTION="${MODE#--}"
+    if [[ "$ACTION" == "rollback" ]]; then ACTION="recover"; fi
+    exec python3 "$ROOT/tools/production-transaction.py" "$ACTION" --repo "$ROOT" --root /
     ;;
   *) usage;exit 2;;
 esac
