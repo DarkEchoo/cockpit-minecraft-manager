@@ -160,7 +160,8 @@ def recover(root):
             shutil.copy2(tx / "backups" / entry["path"], temp)
             with temp.open("rb") as f: os.fsync(f.fileno())
             os.replace(temp, dst)
-        syncdir(dst.parent)
+        if dst.parent.exists():
+            syncdir(dst.parent)
     shutil.rmtree(tx)
     syncdir(root)
     return len(entries)
