@@ -15,7 +15,18 @@ GROUPS={
  "backup_helpers":("addons/backup-manager/helpers","/usr/local/libexec"),
 }
 CONFIG="/etc/cockpit-minecraft/backup-manager.json"
-UNIT_FILES=("cockpit-mc-snapshot@.service","cockpit-mc-snapshot@.timer")
+# Existing host-owned systemd resources must not be overwritten on upgrade.
+PRESERVED_UNITS=(
+ "cockpit-mc-snapshot@.service", "cockpit-mc-snapshot@.timer",
+ "cockpit-minecraft-metrics.service", "cockpit-minecraft-metrics.timer",
+ "minecraft-26.service", "minecraft-announcements.service",
+ "minecraft-announcements.timer", "minecraft-backup.service",
+ "minecraft-default-port.service", "minecraft-join-announcer.service",
+ "minecraft-ops-v9.service", "minecraft-ops-v9.timer",
+ "minecraft-resource-queue.service", "minecraft-resource-queue.timer",
+)
+
+UNIT_FILES=PRESERVED_UNITS
 
 def plan(root=ROOT, frontend="/usr/local/share/cockpit/minecraft-manager", libexec="/usr/local/libexec"):
  root=Path(root)
@@ -52,6 +63,8 @@ def plan(root=ROOT, frontend="/usr/local/share/cockpit/minecraft-manager", libex
   blockers.append("Conflicting package destinations: "+", ".join(sorted(duplicate_destinations)))
  return {"read_only":True,"files":files,"blockers":blockers,
          "configuration_policy":"preserve-existing; configure separately on fresh installations",
+         "directory_policy":{"frontend":"root:root 0755","libexec":"preserve existing parent ownership and mode; installed helpers root:root 0755"},
+         "unit_policy":"do not overwrite or enable any existing systemd unit or timer",
          "excluded_from_transaction":[CONFIG,*("/etc/systemd/system/"+f for f in UNIT_FILES),
                                       "Minecraft servers/worlds","backup volumes","systemd timer state"],
          "production_apply_enabled":False}
