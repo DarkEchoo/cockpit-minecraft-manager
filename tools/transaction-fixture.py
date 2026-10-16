@@ -64,6 +64,7 @@ def transact(sandbox, source, destination, fail_after=None):
     backups.mkdir()
     journal = []
     staged = []
+    preserve_recovery = False
     try:
         # Stage all file data and original copies BEFORE touching destinations.
         for index, file in enumerate(inputs):
@@ -98,13 +99,13 @@ def transact(sandbox, source, destination, fail_after=None):
                 failures.append(f"{target}: {error}")
         if failures:
             # Preserve tx backups for manual recovery; never discard them.
+            preserve_recovery = True
             raise RuntimeError("Rollback incomplete; recovery material at "
                                + str(tx) + ": " + "; ".join(failures))
         raise
     finally:
-        # Keep transaction data if rollback was incomplete.
-        # In normal paths the backups are temporary because this is fixture-only.
-        if not any(p.exists() for p in backups.iterdir()) or len(journal) == len(staged):
+        # Keep recovery files if any rollback operation failed.
+        if not preserve_recovery:
             shutil.rmtree(tx, ignore_errors=True)
 
 
