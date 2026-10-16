@@ -1,0 +1,9 @@
+# Reference template ONLY. Do not enable automatically. Review system user and host paths.
+[Unit]
+Description=Apply pending Minecraft resources only after servers stop
+After=network.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/cockpit-minecraft-resource-queue tick
+TimeoutStartSec=150
+NoNewPrivileges=true
