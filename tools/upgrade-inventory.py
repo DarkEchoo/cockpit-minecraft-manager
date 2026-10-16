@@ -7,6 +7,7 @@ Never reads file contents, copies, modifies, deletes, or starts services.
 import argparse
 import json
 import pathlib
+import os
 import stat
 
 FRONTEND = pathlib.Path("cockpit/minecraft-manager")
@@ -30,19 +31,34 @@ def build_plan(source, frontend_target=TARGET_FRONTEND, backend_target=TARGET_BA
                 blockers.append(f"Unexpected source item (not regular file): {src}")
                 continue
             dst = dst_dir / src.name
-            if dst.is_symlink() or (dst.exists() and not dst.is_file()):
-                blockers.append(f"Unsafe destination type: {dst}")
+            try:
+                info = os.stat(dst, follow_symlinks=False)
+            except FileNotFoundError:
+                # Confirm parent is accessible: missing and inaccessible differ.
+                try:
+                    parent = os.stat(dst_dir, follow_symlinks=False)
+                    if not stat.S_ISDIR(parent.st_mode):
+                        raise NotADirectoryError(str(dst_dir))
+                except OSError as exc:
+                    blockers.append(f"Cannot inspect destination directory: {dst_dir} ({type(exc).__name__})")
+                    continue
+                exists = False
+            except OSError as exc:
+                blockers.append(f"Cannot inspect destination: {dst} ({type(exc).__name__})")
                 continue
-            # A missing backend destination may reflect a legacy install path.
-            # Do not classify it as safe to install without deployment review.
-            review_required = src_dir == source / BACKEND and not dst.exists()
+            else:
+                if not stat.S_ISREG(info.st_mode):
+                    blockers.append(f"Unsafe destination type: {dst}")
+                    continue
+                exists = True
+            review_required = src_dir == source / BACKEND and not exists
             if review_required:
                 blockers.append(f"Backend location/dependencies require review: {dst}")
             candidates.append({
                 "source": str(src),
                 "destination": str(dst),
-                "action": "replace-existing-file" if dst.exists() else ("review-backend-path" if review_required else "install-new-file"),
-                "backup_existing": dst.exists(),
+                "action": "replace-existing-file" if exists else ("review-backend-path" if review_required else "install-new-file"),
+                "backup_existing": exists,
                 "source_bytes": src.stat().st_size,
             })
     return {
