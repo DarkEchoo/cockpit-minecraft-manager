@@ -40,14 +40,19 @@ def inspect_imports(root=ROOT):
                 for name in names:
                     if name not in STDLIB:
                         found.setdefault(name, set()).add(str(path.relative_to(root)))
+    bundled = {p.stem for base in (root / "backend", root / "addons/backup-manager/helpers") if base.is_dir() for p in base.glob("*.py") if p.is_file()}
     details = []
     for name, paths in sorted(found.items()):
+        if name in bundled:
+            details.append({"module": name, "classification": "bundled", "package_hint": None,
+                            "importable": None, "used_by": sorted(paths)})
+            continue
         # Do not execute imports during audit.
         try:
             available = importlib.util.find_spec(name) is not None
         except (ImportError, ValueError):
             available = False
-        details.append({"module": name, "package_hint": ALIASES.get(name, name),
+        details.append({"module": name, "classification": "external", "package_hint": ALIASES.get(name, name),
                         "importable": available, "used_by": sorted(paths)})
     return {"read_only": True, "dependencies": details, "parse_errors": errors,
             "ready_for_public_install": False,
