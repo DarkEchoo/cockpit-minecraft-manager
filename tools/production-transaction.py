@@ -18,7 +18,12 @@ PROJECT = Path(__file__).resolve().parents[1]
 PARTS = (("cockpit/minecraft-manager", "usr/local/share/cockpit/minecraft-manager"),
          ("backend", "usr/local/libexec"),
          ("addons/backup-manager/helpers", "usr/local/libexec"))
-PRESERVE_EXISTING = frozenset(("minecraft-default-proxy", "minecraft-join-announcer", "minecraft-manual-backup"))
+PRESERVE_EXISTING = frozenset((
+    "minecraft-default-proxy", "minecraft-join-announcer", "minecraft-manual-backup",
+    # Host compatibility review: live versions contain fixes/features not yet merged.
+    "app.js", "cockpit-minecraft-helper", "cockpit-minecraft-join-control",
+    "cockpit-minecraft-modpacks", "cockpit-minecraft-records",
+))
 TRANSACTION = "var/lib/cockpit-minecraft-manager/installer/pending"
 STATE = "journal.json"
 
