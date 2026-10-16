@@ -17,6 +17,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Python unit tests
         run: python3 -m unittest discover -s tests -q
+      - name: Root-owned transaction fixture tests
+        run: |
+          sudo python3 -m unittest discover -s tests -p "test_production_transaction.py" -q
+          sudo python3 -m unittest discover -s tests -p "test_production_package_integration.py" -q
       - name: Python syntax compilation
         run: |
           python3 - <<'PY'
