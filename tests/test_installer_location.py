@@ -14,7 +14,7 @@ class LocationIndependentInstallerTests(unittest.TestCase):
                                     cwd=tmp, capture_output=True, text=True, timeout=30)
             self.assertIn("Source present: cockpit/minecraft-manager/manifest.json",
                           result.stdout)
-            self.assertIn("Unified installer --apply is intentionally blocked", result.stdout)
+            self.assertIn("Unified installer entry point exists", result.stdout)
 
     def test_moved_tree_with_spaces(self):
         with tempfile.TemporaryDirectory(prefix="mc-relocate-") as tmp:
