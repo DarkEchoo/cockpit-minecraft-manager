@@ -16,7 +16,13 @@ case "$MODE" in
     echo 'v1.2 pre-install validation; no host changes will be made.'
     if [[ "$HOST" == "--host" ]]; then
       echo "Checking Cockpit installation and socket (read-only):"
-      python3 "$ROOT/tools/cockpit-prerequisite.py"
+      REPORT="$(python3 "$ROOT/tools/cockpit-prerequisite.py")"
+      printf '%s\\n' "$REPORT"
+      if ! python3 -c 'import json,sys;sys.exit(0 if json.loads(sys.argv[1])["ready"] else 1)' "$REPORT"; then
+        echo 'Cockpit prerequisite check failed. Install Cockpit and activate cockpit.socket before deployment.' >&2
+        echo 'On Ubuntu: sudo apt install cockpit && sudo systemctl enable --now cockpit.socket' >&2
+        exit 4
+      fi
     fi
     bash "$ROOT/tools/release-preflight.sh" $HOST
     ;;
