@@ -12,6 +12,8 @@ usage(){
 MODE="${1:---check}"; shift || true
 HOST=''
 if [[ "${1:-}" == '--host' ]]; then HOST='--host';shift;fi
+ACCEPT=''
+if [[ "$MODE" == '--apply' && "${1:-}" == '--accept' ]]; then ACCEPT=yes; shift; fi
 if (($#));then usage;exit 2;fi
 case "$MODE" in
   --check)
@@ -33,12 +35,30 @@ case "$MODE" in
     python3 "$ROOT/tools/production-transaction.py" inventory --repo "$ROOT" --root /
     ;;
   --apply)
-    if [[ "${HOST:-}" != "" ]]; then usage; exit 2; fi
-    echo 'BLOCKED: v1.2 requires explicit --accept for a host installation.' >&2
-    echo 'The repository still lacks a complete dependency/unit manifest and tested fresh-install/upgrade/rollback procedures.' >&2
-    echo 'No files, Cockpit modules, services, timers, or worlds have been modified.' >&2
-    echo 'Use --check to review the release blockers.' >&2
-    exit 3
+    if [[ -z "$ACCEPT" ]]; then
+      echo 'BLOCKED: production apply requires --accept and final host review.' >&2
+      exit 3
+    fi
+    if (( EUID != 0 )); then echo 'Root required for installation.' >&2; exit 2; fi
+    # Cockpit is a hard requirement; nothing is installed automatically.
+    REPORT="$(python3 "$ROOT/tools/cockpit-prerequisite.py")"
+    if ! python3 -c 'import json,sys;sys.exit(0 if json.loads(sys.argv[1])["ready"] else 1)' "$REPORT"; then
+      echo 'Cockpit is not installed/active; installation aborted.' >&2; exit 4
+    fi
+    # Never create a duplicate Cockpit menu module at the distro path.
+    if [[ -e /usr/share/cockpit/minecraft-manager/manifest.json ]]; then
+      echo 'A second Minecraft Cockpit module exists in /usr/share/cockpit; resolve before installing.' >&2
+      exit 5
+    fi
+    exec 8>/run/lock/cockpit-minecraft-manager-installer.lock
+    flock -n 8 || { echo 'Another installer is active.' >&2; exit 6; }
+    STAGE_CHECK="$(mktemp -d /tmp/cockpit-minecraft-release-check.XXXXXXXX)"
+    trap 'rm -rf -- "$STAGE_CHECK"' EXIT
+    python3 "$ROOT/tools/build-release-stage.py" --repo "$ROOT" --output "$STAGE_CHECK/payload" >/dev/null
+    echo 'Package validated. Installing app files only; existing services, backups, timers and configuration will not change.'
+    python3 "$ROOT/tools/production-transaction.py" apply --repo "$ROOT" --root /
+    echo 'Installed. Verify Cockpit functionality before running sudo bash install.sh --finalize.'
+    echo 'To restore the previous files, run sudo bash install.sh --rollback.'
     ;;
   --rollback|--finalize)
     if (( EUID != 0 )); then echo 'Root required.' >&2; exit 2; fi
