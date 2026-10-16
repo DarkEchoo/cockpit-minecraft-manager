@@ -20,6 +20,7 @@ class ReleaseStageTests(unittest.TestCase):
             self.assertIn("libexec/mc_backup_config.py", paths)
             self.assertIn("templates/systemd/cockpit-mc-snapshot@.service.in", paths)
             self.assertTrue((out / "release-manifest.json").is_file())
+            self.assertIn("libexec/cockpit-minecraft-modpack-audit", paths)
 
     def test_existing_output_refused(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
