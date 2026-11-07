@@ -187,6 +187,75 @@
    sortFilter.value='popular';
    search();
  };
+ const showServerWizard=(project,file,container)=>{
+   const previous=container.querySelector('.mp-server-wizard');
+   if(previous)previous.remove();
+   const wrap=el('section','mp-server-wizard');
+   const heading=el('h4','','Create Minecraft server · '+project.name);
+   wrap.append(heading,el('p','hint','Configure a new server using this CurseForge release. Review checks are read-only. Creation is not enabled until a compatible server package and backup integration have been verified.'));
+   const fields=el('div','mp-wizard-grid');
+   const field=(title,type,value,options)=>{
+     const label=el('label','field',title);
+     let control;
+     if(options){
+       control=el('select');
+       for(const [v,caption] of options)control.add(new Option(caption,v));
+     }else{
+       control=el('input');control.type=type;control.value=value;
+     }
+     label.append(control);fields.append(label);
+     return control;
+   };
+   const suggested=('cf-'+project.name.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'')).slice(0,35).replace(/-$/,'');
+   const name=field('Server ID','text',suggested);
+   name.maxLength=35;name.pattern='[a-z][a-z0-9-]{1,34}';
+   const path=field('Server path','text','/opt/minecraft/managed/'+suggested);
+   const port=field('Port (0 = automatic)','number','0');port.min='0';port.max='65535';
+   const ram=field('Maximum RAM (GiB)','number','8');ram.min='2';ram.max='64';
+   const cpu=field('CPU cores (planned limit)','number','2');cpu.min='1';cpu.max='64';
+   const schedule=field('Backup schedule','',undefined,[
+     ['off','Off / configure later'],['hourly','Hourly'],['6hours','Every 6 hours'],
+     ['12hours','Every 12 hours'],['daily','Daily'],['weekly','Weekly'],
+     ['custom','Custom interval']]);
+   const interval=field('Backup interval (minutes, custom)','number','1440');interval.min='15';interval.max='10080';
+   const repo=field('Existing Restic backup repository','text','');
+   repo.placeholder='/mnt/backups/minecraft-restic';
+   const exportDir=field('Restore export directory (optional)','text','');
+   exportDir.placeholder='/srv/minecraft-restore';
+   name.addEventListener('input',()=>{
+     const slug=name.value;
+     if(path.dataset.userEdited!=='true')path.value='/opt/minecraft/managed/'+slug;
+   });
+   path.addEventListener('input',()=>path.dataset.userEdited='true');
+   wrap.append(fields);
+   const accept=el('label','mp-wizard-eula');
+   const eula=el('input');eula.type='checkbox';
+   accept.append(eula,document.createTextNode(' I have read and agree to the Minecraft EULA for a new server.'));
+   wrap.append(accept);
+   const actions=el('div','toolbar');
+   const review=el('button','btn secondary','Review server setup');
+   review.type='button';
+   const close=el('button','btn secondary','Close setup');
+   close.type='button';close.onclick=()=>wrap.remove();
+   actions.append(review,close);wrap.append(actions);
+   const report=el('pre','mp-wizard-report');
+   report.textContent='No server will be created during review.';
+   wrap.append(report);
+   review.onclick=async()=>{
+     review.disabled=true;report.textContent='Checking selected release and server settings…';
+     try{
+       const plan=await browse('server-plan',project.id,file.id,name.value,path.value,
+         ram.value,cpu.value,port.value,repo.value,schedule.value,interval.value,
+         exportDir.value,String(eula.checked));
+       report.textContent=JSON.stringify(plan,null,2);
+       if(!plan.create_enabled){
+         report.textContent+='\\n\\nCreation remains disabled: '+plan.next_step;
+       }
+     }catch(err){report.textContent='Setup review failed: '+String(err.message||err);}
+     finally{review.disabled=false;}
+   };
+   container.append(wrap);
+ };
  const displayProject=async(id,card,button)=>{
    // One expanded panel at a time, immediately below the corresponding result.
    if(activeCard===card&&!detailPanel.hidden){
@@ -264,7 +333,15 @@
            $m('mp-project-id').value=d.id;$m('mp-file-id').value=found.id;
            say('Selected '+d.name+' / '+found.name+'. Choose a workspace and click Add compatible file. No download was performed.');
          };
-         releases.append(select,el('p','hint','Showing up to 50 latest files; loader/version support must be verified before installation.'));
+         const createServer=el('button','btn secondary','Create Minecraft server…');
+         createServer.type='button';
+         createServer.onclick=()=>{
+           const chosen=files.find(f=>String(f.id)===choice.value);
+           if(!chosen)return;
+           showServerWizard(d,chosen,releases);
+         };
+         releases.append(select,createServer,
+           el('p','hint','Showing up to 50 latest files; server pack, loader and dependency compatibility must be verified before installation.'));
        }catch(err){
          if(detailId===activeDetails){
            loadFilesButton.disabled=false;loadFilesButton.textContent='Retry loading releases';
