@@ -139,7 +139,7 @@
      if(p>last+1)pagination.append(el('span','mp-page-ellipsis','…'));
      button(String(p),p,false,p===currentPage);last=p;
    }
-   button('Next',currentPage+1,currentPage>=knownEnd||!hasMore);
+   button('Next',currentPage+1,currentPage>=knownEnd);
  };
  const search=async(page=1)=>{
    if(searchBusy)return;
