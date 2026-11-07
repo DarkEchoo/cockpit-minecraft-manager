@@ -3,11 +3,17 @@
 (()=>{
  const $m=id=>document.getElementById(id);
  const exe='/usr/local/libexec/cockpit-minecraft-modpacks';
+ const browserExe='/usr/local/libexec/cockpit-minecraft-curseforge-browser';
  const say=(s,error=false)=>{const el=$m('mp-output');el.textContent=typeof s==='string'?s:JSON.stringify(s,null,2);el.style.color=error?'#ff9999':''};
  const call=async(op,...args)=>{
    const output=await cockpit.spawn([exe,op,...args.map(String)],{superuser:'require',err:'message'});
    let data;try{data=JSON.parse(output);}catch{throw Error('Malformed modpack helper response')}
    if(!data.ok)throw Error(data.error||'Operation failed');return data.data;
+ };
+ const browse=async(op,...args)=>{
+   const output=await cockpit.spawn([browserExe,op,...args.map(String)],{superuser:'require',err:'message'});
+   let data;try{data=JSON.parse(output);}catch{throw Error('Malformed CurseForge browser response')}
+   if(!data.ok)throw Error(data.error||'CurseForge request failed');return data.data;
  };
  const run=async(label,fn)=>{say(label+'…');try{say(await fn())}catch(e){say(label+': '+(e.message||String(e)),true)}};
  const update=async()=>{
@@ -24,7 +30,7 @@
  const mcVersion=v=>/^\\d+(?:\\.\\d+){1,3}$/.test(v);
  const loadVersions=async()=>{
    try{
-     const versions=await call('versions');
+     const versions=await browse('versions');
      const previous=versionSelect.value;
      versionSelect.replaceChildren(new Option('All Minecraft versions',''));
      for(const v of versions){if(mcVersion(v))versionSelect.add(new Option(v,v));}
@@ -35,7 +41,7 @@
    detailPanel.hidden=false;
    detailPanel.replaceChildren(el('p','hint','Loading project details…'));
    try{
-     const d=await call('project',id);
+     const d=await browse('project',id);
      detailPanel.replaceChildren();
      const heading=el('h3','',d.name);
      const summary=el('p','',d.summary||'No summary available.');
@@ -73,7 +79,7 @@
    }catch(e){detailPanel.replaceChildren(el('p','',String(e.message||e)));}
  };
  $m('mp-search').onclick=()=>run('CurseForge search',async()=>{
-   const results=await call('search',$m('mp-query').value,$m('mp-category').value,versionSelect.value);
+   const results=await browse('search',$m('mp-query').value,$m('mp-category').value,versionSelect.value);
    $m('mp-results').replaceChildren();detailPanel.hidden=true;
    for(const p of results){
      const item=el('div','sub-panel');
