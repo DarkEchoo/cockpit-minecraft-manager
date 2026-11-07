@@ -68,9 +68,12 @@ if pack.count(header)!=1:
     raise ValueError('Missing or ambiguous packaged browser styles')
 suffix=pack[pack.index(header):]
 if header in current:
-    if current[current.index(header):]!=suffix:
+    start=current.index(header)
+    existing=current[start:].rstrip()
+    previous=suffix.split('/* CurseForge numbered pagination */')[0].rstrip()
+    if existing not in (previous,suffix.rstrip()):
         raise ValueError('Existing enhanced browser styles have been customized')
-    result=current
+    result=current[:start].rstrip()+'\n\n'+suffix
 else:
     result=current.rstrip()+'\n\n'+suffix
 out.write_text(result)
