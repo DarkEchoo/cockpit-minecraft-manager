@@ -18,3 +18,15 @@
 #mp-project-detail p{white-space:pre-wrap;overflow-wrap:anywhere}
 #mp-results{display:grid;gap:12px;margin-top:14px}
 @media(max-width:600px){.mp-browser-card{align-items:flex-start}.mp-browser-card button{width:100%}}
+
+/* Expanded CurseForge discovery and inline project details */
+.mp-browser-presets{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0}
+.mp-browser-presets .btn{white-space:nowrap}
+.mp-browser-inline-detail{min-width:0;width:100%;margin:0 0 10px;padding:20px 24px;border-left:3px solid var(--primary);border-radius:10px;background:var(--surface)}
+.mp-browser-inline-detail h3{margin:0 0 4px}
+.mp-browser-inline-detail h4{margin:20px 0 10px}
+.mp-browser-description{box-sizing:border-box;display:block;width:100%;min-width:0;max-height:380px;overflow:auto;padding:18px 20px;border-radius:10px;border:1px solid var(--border);background:var(--surface-alt);white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.65;font:inherit;color:var(--text)}
+.mp-browser-inline-detail .mp-browser-project-heading{align-items:center;gap:16px}
+.mp-browser-inline-detail .mp-browser-icon{border-radius:10px}
+#mp-results>.mp-browser-inline-detail{grid-column:1/-1}
+@media(max-width:600px){.mp-browser-inline-detail{padding:14px}.mp-browser-description{padding:14px}}
