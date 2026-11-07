@@ -27,7 +27,7 @@ class IndependentBrowserTests(unittest.TestCase):
  def test_diagnose_only_shows_counts_not_credentials(self):
   def endpoint(path,params=None):
    return {'data':[{'id':1,'name':'Private data not returned'}]}
-  with patch.object(browser,'api',side_effect=endpoint),patch.object(browser.KEY,'is_file',return_value=True),patch.object(browser.KEY,'is_symlink',return_value=False):
+  with patch.object(browser,'api',side_effect=endpoint),patch.object(browser,'KEY',unittest.mock.MagicMock()):
    result=browser.main(['diagnose'])
   self.assertEqual(result['mod_search']['items'],1)
   self.assertNotIn('Private data',str(result))
