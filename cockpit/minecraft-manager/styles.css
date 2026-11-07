@@ -30,3 +30,11 @@
 .mp-browser-inline-detail .mp-browser-icon{border-radius:10px}
 #mp-results>.mp-browser-inline-detail{grid-column:1/-1}
 @media(max-width:600px){.mp-browser-inline-detail{padding:14px}.mp-browser-description{padding:14px}}
+
+/* CurseForge numbered pagination */
+.mp-browser-pagination{display:flex;flex-wrap:wrap;justify-content:center;align-items:center;gap:7px;margin:18px 0 8px;padding:10px 0}
+.mp-browser-pagination[hidden]{display:none}
+.mp-browser-pagination .btn{min-width:42px;padding:8px 12px}
+.mp-browser-pagination .mp-page-current{background:var(--primary);border-color:var(--primary);color:white;font-weight:700}
+.mp-page-ellipsis{padding:0 4px;color:var(--muted)}
+@media(max-width:600px){.mp-browser-pagination{gap:5px}.mp-browser-pagination .btn{min-width:36px;padding:7px 9px}}
