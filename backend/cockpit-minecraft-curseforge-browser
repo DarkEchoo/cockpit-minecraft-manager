@@ -121,21 +121,70 @@ def _search_rank(project,query):
             int(all_words),int(ordered),sum(w in pwords for w in words),
             int(wanted_compact==compact),int(project.get('downloads') or 0))
 
-def search(query,category,version):
-    if len(query)>90 or len(version)>30:raise ValueError('Search too long')
-    if category not in ('modpacks','mods'):raise ValueError('Invalid search category')
-    if version and not minecraft_version(version):raise ValueError('Invalid game version')
-    params={'gameId':MC_GAME_ID,'classId':4471 if category=='modpacks' else 6,
-            'searchFilter':query,'pageSize':50}
-    if query.strip():
-        # CurseForge Core API: 13 = Relevancy; response ranking is supplemented
-        # by exact title/prefix matching so popular unrelated packs do not dominate.
-        params.update({'sortField':13,'sortOrder':'desc'})
+SORTS={'relevance':13,'featured':1,'popular':2,'updated':3,'name':4,'downloads':6,'released':11,'rating':12}
+LOADERS={'any':0,'forge':1,'cauldron':2,'liteloader':3,'fabric':4,'quilt':5,'neoforge':6}
+CLASSES={'modpacks':4471,'mods':6}
+
+def categories(category):
+    if category not in CLASSES:raise ValueError('Unknown CurseForge section')
+    class_id=CLASSES[category]
+    records=api('categories',{'gameId':MC_GAME_ID,'classId':class_id}).get('data',[])
+    options=[]
+    seen=set()
+    for record in records:
+        if not isinstance(record,dict):continue
+        cid=record.get('id')
+        if type(cid)!=int or cid<=0 or cid in seen:continue
+        if record.get('isClass') or record.get('classId') not in (None,class_id):continue
+        seen.add(cid)
+        options.append({'id':cid,'name':str(record.get('name',''))[:80],
+                        'parent':record.get('parentCategoryId'),
+                        'display_index':record.get('displayIndex',999)})
+    return sorted(options,key=lambda c:(c['display_index'],c['name'].casefold()))[:150]
+
+def search_page(query,category,version,category_id='',sort='relevance',loader='any',index='0'):
+    if not isinstance(query,str) or len(query)>90 or len(version)>30:
+        raise ValueError('Search too long')
+    if category not in CLASSES:raise ValueError('Invalid search category')
+    if version and not minecraft_version(version):raise ValueError('Invalid Minecraft version')
+    if sort not in SORTS:raise ValueError('Unsupported sort order')
+    if loader not in LOADERS:raise ValueError('Unsupported loader')
+    if loader!='any' and not version:
+        raise ValueError('Select a Minecraft version before filtering by loader')
+    try:offset=int(index)
+    except (ValueError,TypeError):raise ValueError('Invalid page index') from None
+    if not 0<=offset<=9950 or offset%20:
+        raise ValueError('Invalid search page index')
+    params={'gameId':MC_GAME_ID,'classId':CLASSES[category],
+            'sortField':SORTS[sort],'sortOrder':'asc' if sort=='name' else 'desc',
+            'index':offset,'pageSize':20}
+    if query.strip():params['searchFilter']=query.strip()
     if version:params['gameVersion']=version
-    data=api('mods/search',params).get('data',[])
-    items=[item for p in data if (item:=project_summary(p)) is not None]
-    if query.strip():items.sort(key=lambda p:_search_rank(p,query),reverse=True)
-    return items[:30]
+    if loader!='any':params['modLoaderType']=LOADERS[loader]
+    if category_id:
+        try:cid=int(category_id)
+        except (TypeError,ValueError):raise ValueError('Invalid category ID') from None
+        # Verify the requested category is published within the selected section.
+        if cid not in {c['id'] for c in categories(category)}:
+            raise ValueError('Invalid category for the selected section')
+        params['categoryId']=cid
+    response=api('mods/search',params)
+    items=[item for p in response.get('data',[]) if (item:=project_summary(p)) is not None]
+    # Only apply title boosting to the default relevance mode. User-chosen
+    # download/popularity/date sorts keep the authoritative API order.
+    if sort=='relevance' and query.strip():
+        items.sort(key=lambda p:_search_rank(p,query),reverse=True)
+    paging=response.get('pagination') or {}
+    total=paging.get('totalCount')
+    has_more=bool(total is not None and offset+len(items)<total)
+    if total is None:has_more=len(items)==20 and offset+20<10000
+    return {'items':items,'total':total if isinstance(total,int) else None,
+            'index':offset,'next_index':offset+20 if has_more else None}
+
+def search(query,category,version):
+    # Keep the existing command contract for older deployments and tests.
+    return search_page(query,category,version)['items']
+
 
 def files(project_id):
     pid=int(project_id)
@@ -153,19 +202,20 @@ def files(project_id):
     } for x in data[:50] if isinstance(x,dict)]
 
 def project(project_id):
+    # Keep the initial Details button responsive: one API request only.
     pid=int(project_id)
     if not 0<pid<2**31:raise ValueError('Invalid project ID')
     data=project_summary(api('mods/'+str(pid)).get('data',{}))
     if not data or int(data['id'] or 0)!=pid:raise ValueError('Project not found')
-    description=api('mods/'+str(pid)+'/description',{'stripped':'true'}).get('data','')
-    # Always present as textContent in the browser; never render external HTML.
-    data['description']=str(description)[:6000]
-    data['files']=files(pid)
-    data['supported_versions']=sorted(
-      {v for f in data['files'] for v in f['game_versions'] if minecraft_version(v)},
-      key=lambda v:tuple(int(n) for n in v.split('.')),reverse=True)
-    data['warning']='Showing versions from the most recent 50 project files only.'
     return data
+
+def project_description(project_id):
+    pid=int(project_id)
+    if not 0<pid<2**31:raise ValueError('Invalid project ID')
+    # Plain text is displayed in a bounded, scrollable region on the client.
+    return {'description':str(api('mods/'+str(pid)+'/description',
+                                   {'stripped':'true'}).get('data',''))[:4000]}
+
 
 def main(args):
     if not args:raise ValueError('Operation required')
@@ -173,7 +223,10 @@ def main(args):
     if op=='versions' and not rest:return versions()
     if op=='diagnose' and not rest:return diagnose()
     if op=='search' and len(rest)==3:return search(*rest)
+    if op=='search-page' and len(rest)==7:return search_page(*rest)
+    if op=='categories' and len(rest)==1:return categories(rest[0])
     if op=='project' and len(rest)==1:return project(rest[0])
+    if op=='description' and len(rest)==1:return project_description(rest[0])
     if op=='files' and len(rest)==1:return files(rest[0])
     raise ValueError('Unsupported browser operation')
 
