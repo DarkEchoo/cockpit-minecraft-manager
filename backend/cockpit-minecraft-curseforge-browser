@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""Read-only CurseForge project discovery for Cockpit Minecraft Manager.
+
+No downloads, server changes, world access, or secret disclosure.
+"""
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import urllib.parse
+import urllib.request
+
+KEY=Path('/etc/cockpit-minecraft/curseforge-api-key')
+MC_GAME_ID=432
+ALLOWED_IMAGES=frozenset(('media.forgecdn.net','mediafilez.forgecdn.net',
+                           'edge.forgecdn.net','media.curseforge.com'))
+
+def api(path,params=None):
+    if not KEY.is_file() or KEY.is_symlink():
+        raise ValueError('CurseForge Core API key is not configured')
+    if KEY.stat().st_mode & 0o077:
+        raise ValueError('CurseForge API key must have permissions 0600')
+    key=KEY.read_text().strip()
+    if not key or len(key)>500:
+        raise ValueError('Invalid CurseForge Core API key')
+    url='https://api.curseforge.com/v1/'+path
+    if params:url+='?'+urllib.parse.urlencode(params)
+    req=urllib.request.Request(url,headers={'x-api-key':key,'Accept':'application/json',
+                                            'User-Agent':'CockpitMinecraftManager/1.2'})
+    with urllib.request.urlopen(req,timeout=25) as response:
+        parsed=urllib.parse.urlparse(response.url)
+        if parsed.scheme!='https' or parsed.hostname!='api.curseforge.com':
+            raise ValueError('Unexpected CurseForge metadata redirect')
+        data=response.read(2_000_001)
+    if len(data)>2_000_000:raise ValueError('CurseForge response too large')
+    return json.loads(data)
+
+def minecraft_version(v):
+    return isinstance(v,str) and re.fullmatch(r'[0-9]+(?:\.[0-9]+){1,3}',v) is not None
+
+def safe_image(value):
+    if not isinstance(value,str) or len(value)>800:return ''
+    parsed=urllib.parse.urlparse(value)
+    if parsed.scheme!='https' or parsed.hostname not in ALLOWED_IMAGES or parsed.username or parsed.password:
+        return ''
+    return value
+
+def project_summary(p):
+    if not isinstance(p,dict):return None
+    logo=p.get('logo') if isinstance(p.get('logo'),dict) else {}
+    links=p.get('links') if isinstance(p.get('links'),dict) else {}
+    return {
+      'id':p.get('id'),
+      'name':str(p.get('name',''))[:160],
+      'summary':str(p.get('summary',''))[:1200],
+      'downloads':p.get('downloadCount',0),
+      'slug':str(p.get('slug',''))[:120],
+      'icon':safe_image(logo.get('thumbnailUrl') or logo.get('url')),
+      'authors':[str(x.get('name',''))[:80] for x in p.get('authors',[])[:5] if isinstance(x,dict)],
+      'website':links.get('websiteUrl','') if isinstance(links.get('websiteUrl'),str) else ''
+    }
+
+def versions():
+    data=api('minecraft/version',{'sortDescending':'true'}).get('data',[])
+    out=[]
+    for item in data:
+        if not isinstance(item,dict) or not item.get('approved'):continue
+        v=item.get('versionString')
+        if minecraft_version(v) and v not in out:out.append(v)
+    return out[:200]
+
+def search(query,category,version):
+    if len(query)>90 or len(version)>30:raise ValueError('Search too long')
+    if category not in ('modpacks','mods'):raise ValueError('Invalid search category')
+    if version and not minecraft_version(version):raise ValueError('Invalid game version')
+    params={'gameId':MC_GAME_ID,'classId':4471 if category=='modpacks' else 6,
+            'searchFilter':query,'pageSize':20}
+    if version:params['gameVersion']=version
+    data=api('mods/search',params).get('data',[])
+    return [item for p in data if (item:=project_summary(p)) is not None]
+
+def files(project_id):
+    pid=int(project_id)
+    if not 0<pid<2**31:raise ValueError('Invalid project ID')
+    data=api('mods/'+str(pid)+'/files',{'pageSize':50}).get('data',[])
+    return [{
+      'id':x.get('id'),
+      'name':str(x.get('displayName') or x.get('fileName',''))[:180],
+      'file_name':str(x.get('fileName',''))[:180],
+      'game_versions':[v for v in x.get('gameVersions',[])[:24] if isinstance(v,str)],
+      'release_type':x.get('releaseType'),
+      'file_length':x.get('fileLength',0),
+      'server_pack_id':x.get('serverPackFileId'),
+      'is_server_pack':x.get('isServerPack',False)
+    } for x in data[:50] if isinstance(x,dict)]
+
+def project(project_id):
+    pid=int(project_id)
+    if not 0<pid<2**31:raise ValueError('Invalid project ID')
+    data=project_summary(api('mods/'+str(pid)).get('data',{}))
+    if not data or int(data['id'] or 0)!=pid:raise ValueError('Project not found')
+    description=api('mods/'+str(pid)+'/description',{'stripped':'true'}).get('data','')
+    # Always present as textContent in the browser; never render external HTML.
+    data['description']=str(description)[:6000]
+    data['files']=files(pid)
+    data['supported_versions']=sorted(
+      {v for f in data['files'] for v in f['game_versions'] if minecraft_version(v)},
+      key=lambda v:tuple(int(n) for n in v.split('.')),reverse=True)
+    data['warning']='Showing versions from the most recent 50 project files only.'
+    return data
+
+def main(args):
+    if not args:raise ValueError('Operation required')
+    op,*rest=args
+    if op=='versions' and not rest:return versions()
+    if op=='search' and len(rest)==3:return search(*rest)
+    if op=='project' and len(rest)==1:return project(rest[0])
+    if op=='files' and len(rest)==1:return files(rest[0])
+    raise ValueError('Unsupported browser operation')
+
+if __name__=='__main__':
+    try:
+        if os.geteuid()!=0:raise PermissionError('Administrative access required')
+        print(json.dumps({'ok':True,'data':main(sys.argv[1:])}))
+    except Exception as exc:
+        print(json.dumps({'ok':False,'error':str(exc)[:300]}))
