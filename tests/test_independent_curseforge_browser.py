@@ -47,8 +47,10 @@ class IndependentBrowserTests(unittest.TestCase):
    raise AssertionError(endpoint)
   with patch.object(browser,'api',side_effect=responder):
    detail=browser.main(['project','12'])
-  self.assertEqual(detail['supported_versions'],['1.21.1'])
-  self.assertEqual(detail['description'],'Plain description')
+  self.assertEqual(detail['name'],'A Pack')
+  with patch.object(browser,'api',side_effect=responder):
+   self.assertEqual(browser.main(['description','12'])['description'],'Plain description')
+   self.assertEqual(browser.main(['files','12'])[0]['game_versions'],['Fabric','1.21.1'])
  def test_disallow_remote_html_and_key_exposure(self):
   with self.assertRaises(ValueError):browser.search('test','mods','../etc')
   self.assertNotIn('x-api-key',str(browser.project_summary({'name':'demo','id':1})))
