@@ -38,6 +38,7 @@ jobs:
             if head -n1 "$file" | grep -Eq "^#!.*(bash|/sh)"; then bash -n "$file"; fi
           done
           bash -n install.sh
+          bash -n tools/deploy-curseforge-browser-live.sh
       - name: Frontend JavaScript syntax
         run: |
           for file in cockpit/minecraft-manager/*.js addons/backup-manager/cockpit/*.js; do
