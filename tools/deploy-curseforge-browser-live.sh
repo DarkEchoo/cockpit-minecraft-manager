@@ -11,12 +11,14 @@ declare -a SOURCES=(
   "cockpit/minecraft-manager/modpacks.js"
   "cockpit/minecraft-manager/styles.css"
   "backend/cockpit-minecraft-curseforge-browser"
+  "cockpit/minecraft-manager/manifest.json"
 )
 declare -a TARGETS=(
   "$FRONTEND/index.html"
   "$FRONTEND/modpacks.js"
   "$FRONTEND/styles.css"
   "$BACKEND/cockpit-minecraft-curseforge-browser"
+  "$FRONTEND/manifest.json"
 )
 EXPECTED_ORIGINAL_JS="3754c04816c1ee20ad363105db864ef8e6f80a0a88099c98cbb68a4274771911"
 EXPECTED_ORIGINAL_CSS="45879d318245ee335d6baa79fdb59961270a2eafbd0ed9afbc7ba7f1bea94c4d"
@@ -45,7 +47,7 @@ function rollback_dir(){
   while IFS='|' read -r rel status; do
     (( i++ )) || true
     case "$rel" in
-      index.html|modpacks.js|styles.css) dest="$FRONTEND/$rel";;
+      index.html|modpacks.js|styles.css|manifest.json) dest="$FRONTEND/$rel";;
       cockpit-minecraft-curseforge-browser) dest="$BACKEND/$rel";;
       *) die 'Unexpected backup entry';;
     esac
@@ -99,6 +101,11 @@ trap 'rm -rf -- "$stage"' EXIT
 if ! python3 "$ROOT/tools/patch-live-curseforge-html.py" "${TARGETS[0]}" "$stage/index.html"; then
   die 'Existing HTML differs from the expected browser panel. No files changed; manual compatibility review required.'
 fi
+# Keep every existing manifest setting, changing only the image load policy.
+# Allow only explicitly reviewed CurseForge image hosts; no broad HTTPS wildcard.
+if ! python3 "$ROOT/tools/patch-live-curseforge-manifest.py" "$FRONTEND/manifest.json" "$stage/manifest.json"; then
+  die 'Existing Cockpit manifest policy needs manual review. No files changed.'
+fi
 for src in "${SOURCES[@]}"; do
   [[ -f "$ROOT/$src" && ! -L "$ROOT/$src" ]] || die "Unsafe or missing package: $src"
 done
@@ -145,9 +152,10 @@ for i in "${!SOURCES[@]}"; do
   [[ "$i" -eq 3 ]] && mode=755
   source_file="$ROOT/${SOURCES[$i]}"
   [[ "$i" -eq 0 ]] && source_file="$stage/index.html"
+  [[ "$i" -eq 4 ]] && source_file="$stage/manifest.json"
   install -o root -g root -m "$mode" "$source_file" "$target"
 done
 trap - ERR
-echo 'CurseForge browser deployed. Existing Minecraft helper, services, worlds and backups were not touched.'
+echo 'CurseForge browser and restricted image policy deployed. Existing Minecraft helper, services, worlds and backups were not touched.'
 echo 'Refresh the Cockpit page with Ctrl+Shift+R, open Modpacks, and select a Minecraft version.'
 echo "To undo ONLY this browser deployment: sudo bash '$ROOT/tools/deploy-curseforge-browser-live.sh' --rollback '$backup'"
