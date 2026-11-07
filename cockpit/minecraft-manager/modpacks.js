@@ -25,78 +25,184 @@
  $m('mp-refresh').onclick=()=>run('Load workspaces',update);
  const versionSelect=$m('mp-search-version');
  const detailPanel=$m('mp-project-detail');
+ const resultsPanel=$m('mp-results');
+ const searchBtn=$m('mp-search');
+ const categoryRoot=$m('mp-category');
+ const queryInput=$m('mp-query');
  const el=(tag,cls,text)=>{const node=document.createElement(tag);if(cls)node.className=cls;if(text!==undefined)node.textContent=String(text);return node;};
  const safeUrl=(url)=>{try{const u=new URL(url);return u.protocol==='https:'&&['media.forgecdn.net','mediafilez.forgecdn.net','edge.forgecdn.net','media.curseforge.com','static-cdn.jtvnw.net'].includes(u.hostname)?u.href:'';}catch{return '';}};
- const mcVersion=v=>/^\\d+(?:\\.\\d+){1,3}$/.test(v);
+ const mcVersion=v=>/^\d+(?:\.\d+){1,3}$/.test(v);
+ const filters=el('div','form-grid');
+ const makeSelect=(label,id,entries)=>{
+   const holder=el('label','field',label);
+   const select=el('select');select.id=id;
+   for(const [value,title] of entries)select.add(new Option(title,value));
+   holder.append(select);filters.append(holder);
+   return select;
+ };
+ const categoryFilter=makeSelect('Subcategory','mp-filter-subcategory',[['','All categories']]);
+ const loaderFilter=makeSelect('Mod loader','mp-filter-loader',[
+   ['any','Any loader'],['forge','Forge'],['neoforge','NeoForge'],['fabric','Fabric'],['quilt','Quilt']]);
+ const sortFilter=makeSelect('Sort results','mp-filter-sort',[
+   ['relevance','Best match'],['popular','Most popular'],['downloads','Top downloaded'],
+   ['updated','Recently updated'],['released','Recently released'],
+   ['featured','Featured'],['rating','Highest rated'],['name','Name A–Z']]);
+ const controls=el('div','toolbar');
+ const topBtn=el('button','btn secondary','Top downloaded');
+ topBtn.type='button';
+ const popularBtn=el('button','btn secondary','Most popular');
+ popularBtn.type='button';
+ const loadMore=el('button','btn secondary','Load more results');
+ loadMore.type='button';loadMore.hidden=true;
+ const countText=el('p','hint');
+ const searchPanel=searchBtn.parentElement;
+ searchPanel.insertBefore(filters,searchBtn);
+ searchPanel.insertBefore(controls,resultsPanel);
+ controls.append(topBtn,popularBtn);
+ searchPanel.insertBefore(countText,resultsPanel);
+ resultsPanel.after(loadMore);
+ let activeSearch=0,activeDetails=0,nextPage=null,searchBusy=false;
  const loadVersions=async()=>{
    try{
-     const versions=await browse('versions');
-     const previous=versionSelect.value;
+     const values=await browse('versions');
+     const saved=versionSelect.value;
      versionSelect.replaceChildren(new Option('All Minecraft versions',''));
-     for(const v of versions){if(mcVersion(v))versionSelect.add(new Option(v,v));}
-     if([...versionSelect.options].some(x=>x.value===previous))versionSelect.value=previous;
-   }catch(e){say('Minecraft version list unavailable: '+(e.message||e),true);}
+     for(const v of values){if(mcVersion(v))versionSelect.add(new Option(v,v));}
+     if([...versionSelect.options].some(x=>x.value===saved))versionSelect.value=saved;
+   }catch(e){countText.textContent='Version list unavailable: '+String(e.message||e);}
  };
- const displayProject=async(id)=>{
+ const loadCategories=async()=>{
+   const requested=categoryRoot.value;
+   const previous=categoryFilter.value;
+   categoryFilter.replaceChildren(new Option('All categories',''));
+   categoryFilter.disabled=true;
+   try{
+     const values=await browse('categories',requested);
+     if(requested!==categoryRoot.value)return;
+     for(const category of values){categoryFilter.add(new Option(category.name,String(category.id)));}
+     if([...categoryFilter.options].some(o=>o.value===previous))categoryFilter.value=previous;
+   }catch(e){countText.textContent='Subcategory list unavailable: '+String(e.message||e);}
+   finally{if(requested===categoryRoot.value)categoryFilter.disabled=false;}
+ };
+ categoryRoot.addEventListener('change',()=>{categoryFilter.value='';loadCategories();});
+ const readFilters=()=>[queryInput.value,categoryRoot.value,versionSelect.value,
+     categoryFilter.value,sortFilter.value,loaderFilter.value];
+ const showCard=p=>{
+   const item=el('div','sub-panel mp-browser-card');
+   const art=safeUrl(p.icon);
+   if(art){
+     const img=el('img','mp-browser-icon');
+     img.src=art;img.alt=p.name+' icon';img.width=64;img.height=64;img.loading='lazy';img.referrerPolicy='no-referrer';
+     item.append(img);
+   }
+   const body=el('div','mp-browser-card-content');
+   body.append(el('strong','',p.name),el('p','',p.summary||'No summary available.'));
+   const authors=p.authors?.length?'By '+p.authors.join(', ')+' · ':'';
+   body.append(el('p','hint',authors+Number(p.downloads||0).toLocaleString()+' downloads'));
+   item.append(body);
+   const detail=el('button','btn secondary','Details / versions');
+   detail.type='button';detail.onclick=()=>displayProject(p.id);
+   item.append(detail);
+   resultsPanel.append(item);
+ };
+ const search=async(more=false)=>{
+   if(searchBusy)return;
+   const values=readFilters();
+   if(values[5]!=='any'&&!values[2]){countText.textContent='Choose a Minecraft version to filter by mod loader.';return;}
+   const requestId=++activeSearch;
+   const offset=more?nextPage:0;
+   if(more&&offset===null)return;
+   searchBusy=true;searchBtn.disabled=true;loadMore.disabled=true;
+   countText.textContent=more?'Loading more results…':'Searching CurseForge…';
+   if(!more){resultsPanel.replaceChildren();detailPanel.hidden=true;nextPage=null;loadMore.hidden=true;}
+   try{
+     const sort=values[4]==='relevance'&&!values[0].trim()?'popular':values[4];
+     const data=await browse('search-page',...values.slice(0,4),sort,values[5],String(offset));
+     if(requestId!==activeSearch)return;
+     for(const project of data.items||[])showCard(project);
+     nextPage=data.next_index;
+     loadMore.hidden=nextPage===null||nextPage===undefined;
+     countText.textContent=resultsPanel.children.length+' shown'+(data.total!==null&&data.total!==undefined?' of '+Number(data.total).toLocaleString():'')+
+       '. Sorting and filters are applied by CurseForge.';
+   }catch(e){countText.textContent='Search failed: '+String(e.message||e);}
+   finally{searchBusy=false;searchBtn.disabled=false;loadMore.disabled=false;}
+ };
+ searchBtn.onclick=()=>search();
+ loadMore.onclick=()=>search(true);
+ queryInput.addEventListener('keydown',e=>{if(e.key==='Enter')search();});
+ topBtn.onclick=()=>{sortFilter.value='downloads';search();};
+ popularBtn.onclick=()=>{sortFilter.value='popular';search();};
+ const displayProject=async id=>{
+   const detailId=++activeDetails;
    detailPanel.hidden=false;
-   detailPanel.replaceChildren(el('p','hint','Loading project details…'));
+   detailPanel.replaceChildren(el('p','hint','Loading project overview…'));
+   detailPanel.scrollIntoView({block:'nearest',behavior:'auto'});
    try{
      const d=await browse('project',id);
+     if(detailId!==activeDetails)return;
      detailPanel.replaceChildren();
-     const heading=el('h3','',d.name);
-     const summary=el('p','',d.summary||'No summary available.');
-     const headingRow=el('div','');
-     headingRow.className='mp-browser-project-heading';
+     const headingRow=el('div','mp-browser-project-heading');
      const art=safeUrl(d.icon);
-     if(art){const img=el('img');img.src=art;img.alt=d.name+' icon';img.loading='lazy';img.width=80;img.height=80;img.className='mp-browser-icon';img.referrerPolicy='no-referrer';headingRow.append(img);}
-     const info=el('div');info.append(heading,summary);headingRow.append(info);
-     detailPanel.append(headingRow);
+     if(art){
+       const img=el('img','mp-browser-icon');
+       img.src=art;img.alt=d.name+' icon';img.loading='lazy';img.width=80;img.height=80;img.referrerPolicy='no-referrer';
+       headingRow.append(img);
+     }
+     const info=el('div','');
+     info.append(el('h3','',d.name),el('p','',d.summary||'No summary available.'));
+     headingRow.append(info);detailPanel.append(headingRow);
      if(d.authors?.length)detailPanel.append(el('p','hint','By '+d.authors.join(', ')));
-     detailPanel.append(el('h4','','Description'),el('p','',d.description||'Description not provided by CurseForge.'));
-     detailPanel.append(el('h4','','Minecraft versions'));
-     detailPanel.append(el('p','',d.supported_versions?.join(', ')||'Version information unavailable.'));
-     detailPanel.append(el('p','hint',d.warning));
-     if(d.files?.length){
-       const releaseLabel=el('label','field','Available release / file');
-       const fileSelect=el('select');
-       for(const file of d.files){
-         const versions=file.game_versions.filter(mcVersion).join(', ');
-         const option=new Option(file.name+' — '+(versions||'Unspecified Minecraft version'),String(file.id));
-         fileSelect.add(option);
+     const descriptionLabel=el('h4','','Description');
+     const desc=el('textarea','');
+     desc.rows=6;desc.readOnly=true;desc.value='Loading description…';
+     desc.setAttribute('aria-label','Project description');
+     detailPanel.append(descriptionLabel,desc);
+     const filesTitle=el('h4','','Available release files');
+     const releases=el('div','');
+     const loadFilesButton=el('button','btn secondary','Load release versions');
+     loadFilesButton.type='button';
+     releases.append(loadFilesButton,el('p','hint','Release files are loaded only when requested to keep the Cockpit page responsive.'));
+     detailPanel.append(filesTitle,releases);
+     // Separate slow network requests from the initial project display.
+     browse('description',id).then(data=>{
+       if(detailId===activeDetails)desc.value=data.description||'No description available.';
+     }).catch(err=>{if(detailId===activeDetails)desc.value='Description unavailable: '+String(err.message||err);});
+     loadFilesButton.onclick=async()=>{
+       loadFilesButton.disabled=true;loadFilesButton.textContent='Loading releases…';
+       try{
+         const files=await browse('files',id);
+         if(detailId!==activeDetails)return;
+         releases.replaceChildren();
+         if(!files.length){releases.append(el('p','hint','No release files reported.'));return;}
+         const supported=[...new Set(files.flatMap(f=>(f.game_versions||[]).filter(mcVersion)))];
+         if(supported.length)releases.append(el('p','hint','Minecraft versions in these releases: '+supported.join(', ')));
+         const fileLabel=el('label','field','Select release');
+         const choice=el('select');
+         for(const file of files){
+           const vs=(file.game_versions||[]).filter(mcVersion).join(', ');
+           choice.add(new Option(file.name+' — '+(vs||'Minecraft version not specified'),String(file.id)));
+         }
+         fileLabel.append(choice);releases.append(fileLabel);
+         const select=el('button','btn secondary','Use selected file in workspace');
+         select.type='button';
+         select.onclick=()=>{
+           const found=files.find(f=>String(f.id)===choice.value);
+           if(!found)return;
+           $m('mp-project-id').value=d.id;$m('mp-file-id').value=found.id;
+           say('Selected '+d.name+' / '+found.name+'. Choose a workspace and click Add compatible file. No download was performed.');
+         };
+         releases.append(select,el('p','hint','Showing up to 50 latest files; loader/version support must be verified before installation.'));
+       }catch(err){
+         if(detailId===activeDetails){
+           loadFilesButton.disabled=false;loadFilesButton.textContent='Retry loading releases';
+           releases.append(el('p','hint','Release lookup failed: '+String(err.message||err)));
+         }
        }
-       releaseLabel.append(fileSelect);
-       const selectBtn=el('button','btn secondary','Use selected file in Modpack workspace');
-       selectBtn.type='button';
-       selectBtn.onclick=()=>{
-         const file=d.files.find(f=>String(f.id)===fileSelect.value);
-         if(!file)return;
-         $m('mp-project-id').value=d.id;
-         $m('mp-file-id').value=file.id;
-         say('Selected '+d.name+' / '+file.name+'. Choose a workspace below, then click Add compatible file to planning manifest. No download will occur.');
-       };
-       detailPanel.append(releaseLabel,selectBtn);
-     }else detailPanel.append(el('p','hint','No release files reported.'));
-   }catch(e){detailPanel.replaceChildren(el('p','',String(e.message||e)));}
- };
- $m('mp-search').onclick=()=>run('CurseForge search',async()=>{
-   const results=await browse('search',$m('mp-query').value,$m('mp-category').value,versionSelect.value);
-   $m('mp-results').replaceChildren();detailPanel.hidden=true;
-   for(const p of results){
-     const item=el('div','sub-panel');
-     item.classList.add('mp-browser-card');
-     const art=safeUrl(p.icon);
-     if(art){const img=el('img');img.src=art;img.alt=p.name+' icon';img.width=64;img.height=64;img.loading='lazy';img.style.objectFit='contain';item.append(img);}
-     const body=el('div');body.className='mp-browser-card-content';
-     body.append(el('strong','',p.name),el('p','',p.summary||'No summary available.'));
-     const by=p.authors?.length?'By '+p.authors.join(', ')+' · ':'';
-     body.append(el('p','hint',by+(p.downloads||0).toLocaleString()+' downloads'));
-     item.append(body);
-     const button=el('button','btn secondary','Details / versions');
-     button.type='button';button.onclick=()=>displayProject(p.id);
-     item.append(button);$m('mp-results').append(item);
+     };
+   }catch(e){
+     if(detailId===activeDetails)detailPanel.replaceChildren(el('p','',String(e.message||e)));
    }
-   return results.length+' projects found. Select Details / versions to inspect descriptions and available mod files.';
- });
+ };
  loadVersions();
  $m('mp-new').onclick=()=>run('Create custom modpack manifest',async()=>{const r=await call('create-manifest',$m('mp-name').value,$m('mp-version').value,$m('mp-loader').value);await update();return r});
  $m('mp-import').onclick=async()=>{
