@@ -48,24 +48,78 @@ def api(path,params=None):
     if len(body)>2_000_000:raise ValueError('API response too large')
     return json.loads(body)
 
+def _project_image(value):
+    """Only return HTTPS CurseForge-managed artwork for browser display."""
+    if not isinstance(value,str):return ''
+    url=urllib.parse.urlparse(value)
+    if url.scheme!='https' or not url.hostname:return ''
+    if url.hostname not in ('media.forgecdn.net','mediafilez.forgecdn.net','edge.forgecdn.net','static-cdn.jtvnw.net','media.curseforge.com'):
+        return ''
+    return value[:800]
+
+def _project_data(p):
+    if not isinstance(p,dict):return None
+    logo=p.get('logo') if isinstance(p.get('logo'),dict) else {}
+    authors=[a.get('name','') for a in p.get('authors',[])[:5] if isinstance(a,dict)]
+    # latestFilesIndexes is useful for exploring versions without assuming a file is installable.
+    return {'id':p.get('id'),'name':str(p.get('name',''))[:160],
+            'summary':str(p.get('summary',''))[:1200],
+            'downloads':p.get('downloadCount',0),'slug':str(p.get('slug',''))[:120],
+            'icon':_project_image(logo.get('thumbnailUrl') or logo.get('url')),
+            'authors':authors,
+            'website':p.get('links',{}).get('websiteUrl','') if isinstance(p.get('links'),dict) else '',
+            'latest_files':[{'id':f.get('id'),'name':f.get('fileName'),
+                             'server_pack_id':f.get('serverPackFileId')}
+                            for f in p.get('latestFiles',[])[:12] if isinstance(f,dict)]}
+
+def minecraft_versions():
+    data=api('minecraft/version',{'sortDescending':'true'}).get('data',[])
+    values=[]
+    for item in data:
+        if not isinstance(item,dict) or not item.get('approved'):continue
+        version=item.get('versionString','')
+        if isinstance(version,str) and re.fullmatch(r'[0-9]+(?:\\.[0-9]+){1,3}',version) and version not in values:
+            values.append(version)
+    return values[:200]
+
 def query(text,category='modpacks',version=''):
     if len(text)>90 or len(version)>30:raise ValueError('Search too long')
     if category not in ('modpacks','mods'):raise ValueError('Invalid search category')
+    if version and not re.fullmatch(r'[0-9]+(?:\\.[0-9]+){1,3}',version):
+        raise ValueError('Select a valid Minecraft version')
     params={'gameId':MC_GAME_ID,'classId':4471 if category=='modpacks' else 6,'searchFilter':text,'pageSize':20}
     if version:params['gameVersion']=version
     payload=api('mods/search',params)
-    return [{'id':p['id'],'name':p.get('name',''),'summary':p.get('summary','')[:350],
-             'downloads':p.get('downloadCount',0),'slug':p.get('slug',''),
-             'latest_files':[{'id':f.get('id'),'name':f.get('fileName'), 'server_pack_id':f.get('serverPackFileId')} for f in p.get('latestFiles',[])[:12]]}
-            for p in payload.get('data',[]) if isinstance(p,dict)]
+    return [d for p in payload.get('data',[]) if (d:=_project_data(p)) is not None]
+
+def project_details(project_id):
+    pid=int(project_id)
+    if not 0<pid<2**31:raise ValueError('Invalid project ID')
+    p=api('mods/'+str(pid)).get('data',{})
+    data=_project_data(p)
+    if not data or data['id']!=pid:raise ValueError('CurseForge project not found')
+    desc=api('mods/'+str(pid)+'/description',{'stripped':'true'}).get('data','')
+    # Plain text only; never render remote HTML in an authenticated Cockpit page.
+    data['description']=re.sub(r'\\s{3,}','\\n\\n',str(desc))[:6000]
+    files=cf_files(pid)
+    data['files']=files
+    data['supported_versions']=sorted(
+        {v for f in files for v in f['game_versions'] if re.fullmatch(r'[0-9]+(?:\\.[0-9]+){1,3}',str(v))},
+        key=lambda v:tuple(int(p) for p in v.split('.')),reverse=True)
+    data['warning']='Supported versions are based on the most recent 50 uploaded files, not every historical release.'
+    return data
 
 def cf_files(project_id):
     pid=int(project_id)
-    if pid<=0:raise ValueError('Invalid project ID')
+    if not 0<pid<2**31:raise ValueError('Invalid project ID')
     data=api('mods/'+str(pid)+'/files',{'pageSize':50}).get('data',[])
-    return [{'id':f.get('id'),'name':f.get('fileName'),'server_pack_id':f.get('serverPackFileId'),
-             'is_server_pack':f.get('isServerPack',False),'game_versions':f.get('gameVersions',[])[:12],
-             'release_type':f.get('releaseType'),'file_length':f.get('fileLength',0)} for f in data[:50]]
+    return [{'id':f.get('id'),'name':str(f.get('displayName') or f.get('fileName',''))[:180],
+             'file_name':str(f.get('fileName',''))[:180],
+             'server_pack_id':f.get('serverPackFileId'),
+             'is_server_pack':f.get('isServerPack',False),
+             'game_versions':[str(v)[:40] for v in f.get('gameVersions',[])[:24] if isinstance(v,str)],
+             'release_type':f.get('releaseType'),'file_length':f.get('fileLength',0)}
+            for f in data[:50] if isinstance(f,dict)]
 
 def check_archive(path):
     with zipfile.ZipFile(path) as z:
@@ -495,6 +549,8 @@ def main(args):
     op,*a=args
     if op=='status' and not a:return {'key_configured':KEY.is_file() and KEY.stat().st_mode & 0o077==0,'workspaces':listing()}
     if op=='search' and len(a)==3:return query(*a)
+    if op=='versions' and not a:return minecraft_versions()
+    if op=='project' and len(a)==1:return project_details(a[0])
     if op=='files' and len(a)==1:return cf_files(a[0])
     if op=='create-manifest' and len(a)==3:return new_manifest(*a)
     if op=='loader-plan' and len(a)==1:return loader_plan(a[0])
