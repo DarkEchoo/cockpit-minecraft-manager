@@ -18,7 +18,6 @@ declare -a TARGETS=(
   "$FRONTEND/styles.css"
   "$BACKEND/cockpit-minecraft-curseforge-browser"
 )
-EXPECTED_ORIGINAL_INDEX="4262729ca378473b08c81315b05bf97babab3e83bda5d4d2755726cfb5bd526a"
 EXPECTED_ORIGINAL_JS="3754c04816c1ee20ad363105db864ef8e6f80a0a88099c98cbb68a4274771911"
 EXPECTED_ORIGINAL_CSS="45879d318245ee335d6baa79fdb59961270a2eafbd0ed9afbc7ba7f1bea94c4d"
 
@@ -75,15 +74,14 @@ case "$1" in
   *) usage;exit 2;;
 esac
 
-# Refuse to replace an unrecognized local frontend version. This is a
-# narrowly targeted update, not a full console upgrade.
-for i in 0 1 2; do
+# Preserve a customized index.html with a surgical patch, but refuse to
+# replace unrecognized JavaScript or CSS: those may have live-only features.
+for i in 1 2; do
   src="$ROOT/${SOURCES[$i]}"
   dest="${TARGETS[$i]}"
   [[ -f "$src" && ! -L "$src" ]] || die "Missing local package: $src"
   [[ -f "$dest" && ! -L "$dest" ]] || die "Unexpected installed file: $dest"
   case "$i" in
-    0) expected="$EXPECTED_ORIGINAL_INDEX";;
     1) expected="$EXPECTED_ORIGINAL_JS";;
     2) expected="$EXPECTED_ORIGINAL_CSS";;
   esac
@@ -93,6 +91,14 @@ for i in 0 1 2; do
     die "Customized file $dest (SHA256 $old); refusing to overwrite it."
   fi
 done
+# Produce a minimal HTML patch in a disposable staging directory. The
+# installed page is not overwritten with the repository's full index.html.
+[[ -f "${TARGETS[0]}" && ! -L "${TARGETS[0]}" ]] || die 'Missing or unsafe installed index.html'
+stage="$(mktemp -d /tmp/mc-browser-live-patch.XXXXXXXX)"
+trap 'rm -rf -- "$stage"' EXIT
+if ! python3 "$ROOT/tools/patch-live-curseforge-html.py" "${TARGETS[0]}" "$stage/index.html"; then
+  die 'Existing HTML differs from the expected browser panel. No files changed; manual compatibility review required.'
+fi
 for src in "${SOURCES[@]}"; do
   [[ -f "$ROOT/$src" && ! -L "$ROOT/$src" ]] || die "Unsafe or missing package: $src"
 done
@@ -137,7 +143,9 @@ for i in "${!SOURCES[@]}"; do
   target="${TARGETS[$i]}"
   mode=644
   [[ "$i" -eq 3 ]] && mode=755
-  install -o root -g root -m "$mode" "$ROOT/${SOURCES[$i]}" "$target"
+  source_file="$ROOT/${SOURCES[$i]}"
+  [[ "$i" -eq 0 ]] && source_file="$stage/index.html"
+  install -o root -g root -m "$mode" "$source_file" "$target"
 done
 trap - ERR
 echo 'CurseForge browser deployed. Existing Minecraft helper, services, worlds and backups were not touched.'
