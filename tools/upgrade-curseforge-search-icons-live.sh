@@ -72,7 +72,7 @@ if header in current:
         raise ValueError('Existing enhanced browser styles have been customized')
     result=current
 else:
-    result=current.rstrip()+'\\n\\n'+suffix
+    result=current.rstrip()+'\n\n'+suffix
 out.write_text(result)
 PY
 backup="$(mktemp -d /var/backups/cockpit-minecraft-search-icons.XXXXXXXX)"
