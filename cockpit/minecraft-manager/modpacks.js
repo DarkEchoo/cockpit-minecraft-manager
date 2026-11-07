@@ -52,16 +52,27 @@
  topBtn.type='button';
  const popularBtn=el('button','btn secondary','Most popular');
  popularBtn.type='button';
+ const featuredBtn=el('button','btn secondary','Featured');
+ featuredBtn.type='button';
+ const updatedBtn=el('button','btn secondary','Recently updated');
+ updatedBtn.type='button';
+ const releasedBtn=el('button','btn secondary','New releases');
+ releasedBtn.type='button';
+ const ratedBtn=el('button','btn secondary','Top rated');
+ ratedBtn.type='button';
+ const clearBtn=el('button','btn secondary','Reset filters');
+ clearBtn.type='button';
  const loadMore=el('button','btn secondary','Load more results');
  loadMore.type='button';loadMore.hidden=true;
  const countText=el('p','hint');
  const searchPanel=searchBtn.parentElement;
  searchPanel.insertBefore(filters,searchBtn);
  searchPanel.insertBefore(controls,resultsPanel);
- controls.append(topBtn,popularBtn);
+ controls.classList.add('mp-browser-presets');
+ controls.append(topBtn,popularBtn,featuredBtn,updatedBtn,releasedBtn,ratedBtn,clearBtn);
  searchPanel.insertBefore(countText,resultsPanel);
  resultsPanel.after(loadMore);
- let activeSearch=0,activeDetails=0,nextPage=null,searchBusy=false;
+ let activeSearch=0,activeDetails=0,nextPage=null,searchBusy=false,displayedCount=0,activeCard=null;
  const loadVersions=async()=>{
    try{
      const values=await browse('versions');
@@ -101,7 +112,8 @@
    body.append(el('p','hint',authors+Number(p.downloads||0).toLocaleString()+' downloads'));
    item.append(body);
    const detail=el('button','btn secondary','Details / versions');
-   detail.type='button';detail.onclick=()=>displayProject(p.id);
+   detail.type='button';detail.setAttribute('aria-expanded','false');
+   detail.onclick=()=>displayProject(p.id,item,detail);
    item.append(detail);
    resultsPanel.append(item);
  };
@@ -114,15 +126,15 @@
    if(more&&offset===null)return;
    searchBusy=true;searchBtn.disabled=true;loadMore.disabled=true;
    countText.textContent=more?'Loading more results…':'Searching CurseForge…';
-   if(!more){resultsPanel.replaceChildren();detailPanel.hidden=true;nextPage=null;loadMore.hidden=true;}
+   if(!more){activeDetails++;activeCard=null;resultsPanel.replaceChildren();detailPanel.remove();detailPanel.hidden=true;nextPage=null;loadMore.hidden=true;displayedCount=0;}
    try{
      const sort=values[4]==='relevance'&&!values[0].trim()?'popular':values[4];
      const data=await browse('search-page',...values.slice(0,4),sort,values[5],String(offset));
      if(requestId!==activeSearch)return;
-     for(const project of data.items||[])showCard(project);
+     for(const project of data.items||[]){showCard(project);displayedCount++;}
      nextPage=data.next_index;
      loadMore.hidden=nextPage===null||nextPage===undefined;
-     countText.textContent=resultsPanel.children.length+' shown'+(data.total!==null&&data.total!==undefined?' of '+Number(data.total).toLocaleString():'')+
+     countText.textContent=displayedCount+' shown'+(data.total!==null&&data.total!==undefined?' of '+Number(data.total).toLocaleString():'')+
        '. Sorting and filters are applied by CurseForge.';
    }catch(e){countText.textContent='Search failed: '+String(e.message||e);}
    finally{searchBusy=false;searchBtn.disabled=false;loadMore.disabled=false;}
@@ -130,13 +142,44 @@
  searchBtn.onclick=()=>search();
  loadMore.onclick=()=>search(true);
  queryInput.addEventListener('keydown',e=>{if(e.key==='Enter')search();});
- topBtn.onclick=()=>{sortFilter.value='downloads';search();};
- popularBtn.onclick=()=>{sortFilter.value='popular';search();};
- const displayProject=async id=>{
+ const quickSort=sort=>{sortFilter.value=sort;search();};
+ topBtn.onclick=()=>quickSort('downloads');
+ popularBtn.onclick=()=>quickSort('popular');
+ featuredBtn.onclick=()=>quickSort('featured');
+ updatedBtn.onclick=()=>quickSort('updated');
+ releasedBtn.onclick=()=>quickSort('released');
+ ratedBtn.onclick=()=>quickSort('rating');
+ clearBtn.onclick=()=>{
+   queryInput.value='';
+   versionSelect.value='';
+   categoryFilter.value='';
+   loaderFilter.value='any';
+   sortFilter.value='popular';
+   search();
+ };
+ const displayProject=async(id,card,button)=>{
+   // One expanded panel at a time, immediately below the corresponding result.
+   if(activeCard===card&&!detailPanel.hidden){
+     activeDetails++;
+     detailPanel.hidden=true;
+     detailPanel.remove();
+     button.setAttribute('aria-expanded','false');
+     button.textContent='Details / versions';
+     activeCard=null;
+     return;
+   }
+   if(activeCard){
+     const previous=activeCard.querySelector('[aria-expanded="true"]');
+     if(previous){previous.setAttribute('aria-expanded','false');previous.textContent='Details / versions';}
+   }
+   activeCard=card;
+   button.setAttribute('aria-expanded','true');
+   button.textContent='Hide details';
+   card.after(detailPanel);
    const detailId=++activeDetails;
    detailPanel.hidden=false;
+   detailPanel.classList.add('mp-browser-inline-detail');
    detailPanel.replaceChildren(el('p','hint','Loading project overview…'));
-   detailPanel.scrollIntoView({block:'nearest',behavior:'auto'});
    try{
      const d=await browse('project',id);
      if(detailId!==activeDetails)return;
@@ -153,8 +196,8 @@
      headingRow.append(info);detailPanel.append(headingRow);
      if(d.authors?.length)detailPanel.append(el('p','hint','By '+d.authors.join(', ')));
      const descriptionLabel=el('h4','','Description');
-     const desc=el('textarea','');
-     desc.rows=6;desc.readOnly=true;desc.value='Loading description…';
+     const desc=el('div','mp-browser-description','Loading description…');
+     desc.setAttribute('role','region');
      desc.setAttribute('aria-label','Project description');
      detailPanel.append(descriptionLabel,desc);
      const filesTitle=el('h4','','Available release files');
@@ -165,8 +208,8 @@
      detailPanel.append(filesTitle,releases);
      // Separate slow network requests from the initial project display.
      browse('description',id).then(data=>{
-       if(detailId===activeDetails)desc.value=data.description||'No description available.';
-     }).catch(err=>{if(detailId===activeDetails)desc.value='Description unavailable: '+String(err.message||err);});
+       if(detailId===activeDetails)desc.textContent=data.description||'No description available.';
+     }).catch(err=>{if(detailId===activeDetails)desc.textContent='Description unavailable: '+String(err.message||err);});
      loadFilesButton.onclick=async()=>{
        loadFilesButton.disabled=true;loadFilesButton.textContent='Loading releases…';
        try{
