@@ -46,9 +46,9 @@
      const heading=el('h3','',d.name);
      const summary=el('p','',d.summary||'No summary available.');
      const headingRow=el('div','');
-     headingRow.style.display='flex';headingRow.style.gap='16px';headingRow.style.alignItems='center';
+     headingRow.className='mp-browser-project-heading';
      const art=safeUrl(d.icon);
-     if(art){const img=el('img');img.src=art;img.alt=d.name+' icon';img.loading='lazy';img.width=80;img.height=80;img.style.objectFit='contain';headingRow.append(img);}
+     if(art){const img=el('img');img.src=art;img.alt=d.name+' icon';img.loading='lazy';img.width=80;img.height=80;img.className='mp-browser-icon';headingRow.append(img);}
      const info=el('div');info.append(heading,summary);headingRow.append(info);
      detailPanel.append(headingRow);
      if(d.authors?.length)detailPanel.append(el('p','hint','By '+d.authors.join(', ')));
@@ -83,10 +83,10 @@
    $m('mp-results').replaceChildren();detailPanel.hidden=true;
    for(const p of results){
      const item=el('div','sub-panel');
-     item.style.display='flex';item.style.alignItems='center';item.style.gap='14px';
+     item.classList.add('mp-browser-card');
      const art=safeUrl(p.icon);
      if(art){const img=el('img');img.src=art;img.alt=p.name+' icon';img.width=64;img.height=64;img.loading='lazy';img.style.objectFit='contain';item.append(img);}
-     const body=el('div');body.style.flex='1';
+     const body=el('div');body.className='mp-browser-card-content';
      body.append(el('strong','',p.name),el('p','',p.summary||'No summary available.'));
      const by=p.authors?.length?'By '+p.authors.join(', ')+' · ':'';
      body.append(el('p','hint',by+(p.downloads||0).toLocaleString()+' downloads'));
