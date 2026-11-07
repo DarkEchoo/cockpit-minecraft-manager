@@ -17,18 +17,81 @@
    $m('mp-workspaces').textContent=r.workspaces.map(p=>p.name+' | '+p.loader+' | '+p.minecraft_version+' | '+p.status).join('\n')||'No modpack workspaces yet.';
  };
  $m('mp-refresh').onclick=()=>run('Load workspaces',update);
+ const versionSelect=$m('mp-search-version');
+ const detailPanel=$m('mp-project-detail');
+ const el=(tag,cls,text)=>{const node=document.createElement(tag);if(cls)node.className=cls;if(text!==undefined)node.textContent=String(text);return node;};
+ const safeUrl=(url)=>{try{const u=new URL(url);return u.protocol==='https:'&&['media.forgecdn.net','mediafilez.forgecdn.net','edge.forgecdn.net','media.curseforge.com'].includes(u.hostname)?u.href:'';}catch{return '';}};
+ const mcVersion=v=>/^\\d+(?:\\.\\d+){1,3}$/.test(v);
+ const loadVersions=async()=>{
+   try{
+     const versions=await call('versions');
+     const previous=versionSelect.value;
+     versionSelect.replaceChildren(new Option('All Minecraft versions',''));
+     for(const v of versions){if(mcVersion(v))versionSelect.add(new Option(v,v));}
+     if([...versionSelect.options].some(x=>x.value===previous))versionSelect.value=previous;
+   }catch(e){say('Minecraft version list unavailable: '+(e.message||e),true);}
+ };
+ const displayProject=async(id)=>{
+   detailPanel.hidden=false;
+   detailPanel.replaceChildren(el('p','hint','Loading project details…'));
+   try{
+     const d=await call('project',id);
+     detailPanel.replaceChildren();
+     const heading=el('h3','',d.name);
+     const summary=el('p','',d.summary||'No summary available.');
+     const headingRow=el('div','');
+     headingRow.style.display='flex';headingRow.style.gap='16px';headingRow.style.alignItems='center';
+     const art=safeUrl(d.icon);
+     if(art){const img=el('img');img.src=art;img.alt=d.name+' icon';img.loading='lazy';img.width=80;img.height=80;img.style.objectFit='contain';headingRow.append(img);}
+     const info=el('div');info.append(heading,summary);headingRow.append(info);
+     detailPanel.append(headingRow);
+     if(d.authors?.length)detailPanel.append(el('p','hint','By '+d.authors.join(', ')));
+     detailPanel.append(el('h4','','Description'),el('p','',d.description||'Description not provided by CurseForge.'));
+     detailPanel.append(el('h4','','Minecraft versions'));
+     detailPanel.append(el('p','',d.supported_versions?.join(', ')||'Version information unavailable.'));
+     detailPanel.append(el('p','hint',d.warning));
+     if(d.files?.length){
+       const releaseLabel=el('label','field','Available release / file');
+       const fileSelect=el('select');
+       for(const file of d.files){
+         const versions=file.game_versions.filter(mcVersion).join(', ');
+         const option=new Option(file.name+' — '+(versions||'Unspecified Minecraft version'),String(file.id));
+         fileSelect.add(option);
+       }
+       releaseLabel.append(fileSelect);
+       const selectBtn=el('button','btn secondary','Use selected file in Modpack workspace');
+       selectBtn.type='button';
+       selectBtn.onclick=()=>{
+         const file=d.files.find(f=>String(f.id)===fileSelect.value);
+         if(!file)return;
+         $m('mp-project-id').value=d.id;
+         $m('mp-file-id').value=file.id;
+         say('Selected '+d.name+' / '+file.name+'. Choose a workspace below, then click Add compatible file to planning manifest. No download will occur.');
+       };
+       detailPanel.append(releaseLabel,selectBtn);
+     }else detailPanel.append(el('p','hint','No release files reported.'));
+   }catch(e){detailPanel.replaceChildren(el('p','',String(e.message||e)));}
+ };
  $m('mp-search').onclick=()=>run('CurseForge search',async()=>{
-   const results=await call('search',$m('mp-query').value,$m('mp-category').value,$m('mp-search-version').value.trim());
-   $m('mp-results').replaceChildren();
-   for(const p of results){const item=document.createElement('div');item.className='sub-panel';
-     const title=document.createElement('strong');title.textContent=p.name+' (#'+p.id+')';
-     const summary=document.createElement('p');summary.textContent=p.summary;
-     const button=document.createElement('button');button.className='btn secondary';button.textContent='List releases / server packs';
-     button.onclick=()=>run('CurseForge releases',async()=>{const files=await call('files',p.id);$m('mp-project-id').value=p.id;return files});
-     item.append(title,summary,button);$m('mp-results').append(item);
+   const results=await call('search',$m('mp-query').value,$m('mp-category').value,versionSelect.value);
+   $m('mp-results').replaceChildren();detailPanel.hidden=true;
+   for(const p of results){
+     const item=el('div','sub-panel');
+     item.style.display='flex';item.style.alignItems='center';item.style.gap='14px';
+     const art=safeUrl(p.icon);
+     if(art){const img=el('img');img.src=art;img.alt=p.name+' icon';img.width=64;img.height=64;img.loading='lazy';img.style.objectFit='contain';item.append(img);}
+     const body=el('div');body.style.flex='1';
+     body.append(el('strong','',p.name),el('p','',p.summary||'No summary available.'));
+     const by=p.authors?.length?'By '+p.authors.join(', ')+' · ':'';
+     body.append(el('p','hint',by+(p.downloads||0).toLocaleString()+' downloads'));
+     item.append(body);
+     const button=el('button','btn secondary','Details / versions');
+     button.type='button';button.onclick=()=>displayProject(p.id);
+     item.append(button);$m('mp-results').append(item);
    }
-   return results.length+' projects found. Select a project to inspect files. Downloads require explicit approved API access; no server is installed automatically.';
+   return results.length+' projects found. Select Details / versions to inspect descriptions and available mod files.';
  });
+ loadVersions();
  $m('mp-new').onclick=()=>run('Create custom modpack manifest',async()=>{const r=await call('create-manifest',$m('mp-name').value,$m('mp-version').value,$m('mp-loader').value);await update();return r});
  $m('mp-import').onclick=async()=>{
    const file=$m('mp-zip').files[0];if(!file)return say('Choose a ZIP file first.',true);
