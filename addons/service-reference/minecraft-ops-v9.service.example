@@ -1,0 +1,9 @@
+# Reference template ONLY. Do not enable automatically. Review system user and host paths.
+[Unit]
+Description=Check opted-in Minecraft maintenance restart schedules
+After=network.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/cockpit-minecraft-scheduler-v9 tick
+TimeoutStartSec=200
+NoNewPrivileges=true

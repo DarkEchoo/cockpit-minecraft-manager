@@ -1,0 +1,10 @@
+# Reference template ONLY. Do not enable automatically. Review system user and host paths.
+[Unit]
+Description=Check Minecraft scheduled announcements every minute
+[Timer]
+OnCalendar=*-*-* *:*:00
+AccuracySec=15s
+Persistent=false
+Unit=minecraft-announcements.service
+[Install]
+WantedBy=timers.target

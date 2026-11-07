@@ -1,0 +1,10 @@
+# Reference template ONLY. Do not enable automatically. Review system user and host paths.
+[Unit]
+Description=Check Minecraft restart schedules once per minute
+[Timer]
+OnCalendar=*-*-* *:*:00
+AccuracySec=10s
+Persistent=false
+Unit=minecraft-ops-v9.service
+[Install]
+WantedBy=timers.target

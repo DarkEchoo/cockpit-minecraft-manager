@@ -799,7 +799,7 @@ function portDisplay(d){
   'Selected target: '+(t?t.label+' (port '+t.port+')':'None'),
   'Forwarder service: '+(d.proxy_active?'RUNNING':'stopped'),
   'Listener on 25565: '+(d.port_25565_listener?'present':'none'),
-  'Connect: your configured host or private network address (when routing is active)',
+  'Connect: use the configured server address or your VPN address (when routing is active)',
   d.warning||''
  ].join('\n');
 }

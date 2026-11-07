@@ -1,0 +1,11 @@
+# Reference template ONLY. Do not enable automatically. Review system user and host paths.
+[Unit]
+Description=Sample Minecraft performance every minute
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=1min
+AccuracySec=10s
+Persistent=false
+Unit=cockpit-minecraft-metrics.service
+[Install]
+WantedBy=timers.target

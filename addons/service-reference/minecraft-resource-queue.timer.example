@@ -1,0 +1,10 @@
+# Reference template ONLY. Do not enable automatically. Review system user and host paths.
+[Unit]
+Description=Check queued Minecraft resource changes once per minute
+[Timer]
+OnCalendar=*-*-* *:*:00
+AccuracySec=10s
+Persistent=false
+Unit=minecraft-resource-queue.service
+[Install]
+WantedBy=timers.target

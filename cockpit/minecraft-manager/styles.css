@@ -10,3 +10,41 @@
 .activity-section{margin-top:34px;padding-top:27px;border-top:1px solid var(--border)}.activity-heading{margin-bottom:14px}.activity-controls{display:flex;align-items:end;flex-wrap:wrap;gap:12px;margin:18px 0}.activity-controls .field{min-width:175px;flex:1}.activity-controls .field input,.activity-controls .field select{min-height:41px}.activity-check{display:flex;align-items:center;gap:7px;padding:10px 0;font-size:13px}.activity-count{margin-left:auto}.activity-event{display:flex;align-items:start;gap:13px;padding:8px 14px;border-bottom:1px solid #ffffff12;font:12px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}.activity-event .activity-type{font-size:10px;min-width:92px;text-transform:uppercase;letter-spacing:.05em;color:#8bd5fd}.activity-join .activity-type{color:#8ee5a9}.activity-leave .activity-type{color:#e1b986}.activity-chat .activity-type{color:#a6d9ff}.activity-command .activity-type{color:#f0d38b}.activity-moderation .activity-type{color:#ffa4a4}#player-activity{height:350px;overflow:auto;padding:8px 0;color:#dcf1e2;background:#101923}#player-activity:not(:has(.activity-event)){padding:17px;font-size:13px;color:#adc7bd}
 
 #periodic-panel textarea{width:100%;min-height:110px;resize:vertical}#periodic-panel input[type=number]{max-width:150px}#periodic-history{max-height:180px;overflow:auto;white-space:pre-wrap}
+
+/* CurseForge project cards and artwork */
+.mp-browser-card,.mp-browser-project-heading{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+.mp-browser-card-content{flex:1;min-width:180px}
+.mp-browser-icon{object-fit:contain;border-radius:9px;flex-shrink:0}
+#mp-project-detail p{white-space:pre-wrap;overflow-wrap:anywhere}
+#mp-results{display:grid;gap:12px;margin-top:14px}
+@media(max-width:600px){.mp-browser-card{align-items:flex-start}.mp-browser-card button{width:100%}}
+
+/* Expanded CurseForge discovery and inline project details */
+.mp-browser-presets{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0}
+.mp-browser-presets .btn{white-space:nowrap}
+.mp-browser-inline-detail{min-width:0;width:100%;margin:0 0 10px;padding:20px 24px;border-left:3px solid var(--primary);border-radius:10px;background:var(--surface)}
+.mp-browser-inline-detail h3{margin:0 0 4px}
+.mp-browser-inline-detail h4{margin:20px 0 10px}
+.mp-browser-description{box-sizing:border-box;display:block;width:100%;min-width:0;max-height:380px;overflow:auto;padding:18px 20px;border-radius:10px;border:1px solid var(--border);background:var(--surface-alt);white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.65;font:inherit;color:var(--text)}
+.mp-browser-inline-detail .mp-browser-project-heading{align-items:center;gap:16px}
+.mp-browser-inline-detail .mp-browser-icon{border-radius:10px}
+#mp-results>.mp-browser-inline-detail{grid-column:1/-1}
+@media(max-width:600px){.mp-browser-inline-detail{padding:14px}.mp-browser-description{padding:14px}}
+
+/* CurseForge numbered pagination */
+.mp-browser-pagination{display:flex;flex-wrap:wrap;justify-content:center;align-items:center;gap:7px;margin:18px 0 8px;padding:10px 0}
+.mp-browser-pagination[hidden]{display:none}
+.mp-browser-pagination .btn{min-width:42px;padding:8px 12px}
+.mp-browser-pagination .mp-page-current{background:var(--primary);border-color:var(--primary);color:white;font-weight:700}
+.mp-page-ellipsis{padding:0 4px;color:var(--muted)}
+@media(max-width:600px){.mp-browser-pagination{gap:5px}.mp-browser-pagination .btn{min-width:36px;padding:7px 9px}}
+
+/* CurseForge server setup wizard — preview only */
+.mp-server-wizard{margin-top:18px;padding:20px 22px;border:1px solid var(--border);border-radius:12px;background:var(--surface-alt);width:100%}
+.mp-server-wizard h4{margin:0 0 8px}
+.mp-wizard-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,250px),1fr));gap:14px 18px;margin:18px 0}
+.mp-wizard-grid .field{min-width:0}
+.mp-wizard-grid input,.mp-wizard-grid select{width:100%}
+.mp-wizard-eula{display:flex;gap:8px;align-items:flex-start;margin:14px 0}
+.mp-wizard-report{margin-top:16px;padding:16px;background:var(--surface);border:1px solid var(--border);border-radius:8px;overflow:auto;max-height:380px;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.5 ui-monospace,monospace}
+@media(max-width:600px){.mp-server-wizard{padding:14px}.mp-wizard-grid{grid-template-columns:1fr}}

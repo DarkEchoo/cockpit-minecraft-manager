@@ -1,0 +1,73 @@
+{
+  "schema": 1,
+  "production_install_policy": "never overwrite or enable existing systemd units",
+  "requires_host_setup": true,
+  "units": [
+    {
+      "unit": "cockpit-minecraft-metrics.service",
+      "required_executable": "cockpit-minecraft-metrics-collector",
+      "packaged_executable": true,
+      "policy": "preserve on upgrade; optional host setup for fresh install"
+    },
+    {
+      "unit": "cockpit-minecraft-metrics.timer",
+      "required_executable": null,
+      "packaged_executable": true,
+      "policy": "preserve on upgrade; optional host setup for fresh install"
+    },
+    {
+      "unit": "minecraft-announcements.service",
+      "required_executable": "cockpit-minecraft-announcements",
+      "packaged_executable": true,
+      "policy": "preserve on upgrade; optional host setup for fresh install"
+    },
+    {
+      "unit": "minecraft-announcements.timer",
+      "required_executable": null,
+      "packaged_executable": true,
+      "policy": "preserve on upgrade; optional host setup for fresh install"
+    },
+    {
+      "unit": "minecraft-backup.service",
+      "required_executable": "minecraft-manual-backup",
+      "packaged_executable": false,
+      "policy": "preserve on upgrade; optional host setup for fresh install"
+    },
+    {
+      "unit": "minecraft-default-port.service",
+      "required_executable": "minecraft-default-proxy",
+      "packaged_executable": false,
+      "policy": "preserve on upgrade; optional host setup for fresh install"
+    },
+    {
+      "unit": "minecraft-join-announcer.service",
+      "required_executable": "minecraft-join-announcer",
+      "packaged_executable": false,
+      "policy": "preserve on upgrade; optional host setup for fresh install"
+    },
+    {
+      "unit": "minecraft-ops-v9.service",
+      "required_executable": "cockpit-minecraft-scheduler-v9",
+      "packaged_executable": true,
+      "policy": "preserve on upgrade; optional host setup for fresh install"
+    },
+    {
+      "unit": "minecraft-ops-v9.timer",
+      "required_executable": null,
+      "packaged_executable": true,
+      "policy": "preserve on upgrade; optional host setup for fresh install"
+    },
+    {
+      "unit": "minecraft-resource-queue.service",
+      "required_executable": "cockpit-minecraft-resource-queue",
+      "packaged_executable": true,
+      "policy": "preserve on upgrade; optional host setup for fresh install"
+    },
+    {
+      "unit": "minecraft-resource-queue.timer",
+      "required_executable": null,
+      "packaged_executable": true,
+      "policy": "preserve on upgrade; optional host setup for fresh install"
+    }
+  ]
+}

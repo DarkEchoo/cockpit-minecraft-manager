@@ -1,0 +1,16 @@
+# Optional join and leave announcer unit. Configure RCON access first.
+[Unit]
+Description=Minecraft custom join and leave announcer
+After=systemd-journald.service
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u /usr/local/libexec/minecraft-join-announcer
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictAddressFamilies=AF_UNIX AF_INET
+[Install]
+WantedBy=multi-user.target

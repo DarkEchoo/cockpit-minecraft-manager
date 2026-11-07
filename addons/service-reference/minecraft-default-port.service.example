@@ -1,0 +1,19 @@
+# Optional TCP port forwarding unit. Configure backend port first.
+[Unit]
+Description=Minecraft configurable default-port TCP forwarding
+After=network.target
+[Service]
+Type=simple
+User=minecraft
+Group=minecraft
+ExecStart=/usr/local/libexec/minecraft-default-proxy
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/etc/minecraft-default-port.json
+RestrictAddressFamilies=AF_INET AF_UNIX
+[Install]
+WantedBy=multi-user.target

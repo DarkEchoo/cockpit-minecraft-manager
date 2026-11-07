@@ -1,0 +1,10 @@
+# Optional manual backup unit. Do NOT enable automatically.
+# Requires root-owned /etc/minecraft-backup/manual-backup.conf and a tested restic repository.
+[Unit]
+Description=Minecraft Manual Restic Backup (opt-in)
+Documentation=man:restic(1)
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/libexec/minecraft-manual-backup
+TimeoutStartSec=30min

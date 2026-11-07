@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""Read-only CurseForge project discovery for Cockpit Minecraft Manager.
+
+No downloads, server changes, world access, or secret disclosure.
+"""
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import urllib.parse
+import urllib.request
+
+KEY=Path('/etc/cockpit-minecraft/curseforge-api-key')
+MC_GAME_ID=432
+ALLOWED_IMAGES=frozenset(('media.forgecdn.net','mediafilez.forgecdn.net',
+                           'edge.forgecdn.net','media.curseforge.com'))
+
+def api(path,params=None):
+    if not KEY.is_file() or KEY.is_symlink():
+        raise ValueError('CurseForge Core API key is not configured')
+    if KEY.stat().st_mode & 0o077:
+        raise ValueError('CurseForge API key must have permissions 0600')
+    key=KEY.read_text().strip()
+    if not key or len(key)>500:
+        raise ValueError('Invalid CurseForge Core API key')
+    url='https://api.curseforge.com/v1/'+path
+    if params:url+='?'+urllib.parse.urlencode(params)
+    req=urllib.request.Request(url,headers={'x-api-key':key,'Accept':'application/json',
+                                            'User-Agent':'CockpitMinecraftManager/1.2'})
+    with urllib.request.urlopen(req,timeout=25) as response:
+        parsed=urllib.parse.urlparse(response.url)
+        if parsed.scheme!='https' or parsed.hostname!='api.curseforge.com':
+            raise ValueError('Unexpected CurseForge metadata redirect')
+        data=response.read(2_000_001)
+    if len(data)>2_000_000:raise ValueError('CurseForge response too large')
+    return json.loads(data)
+
+def minecraft_version(v):
+    return isinstance(v,str) and re.fullmatch(r'[0-9]+(?:\.[0-9]+){1,3}',v) is not None
+
+def safe_image(value):
+    if not isinstance(value,str) or len(value)>800:return ''
+    parsed=urllib.parse.urlparse(value)
+    if parsed.scheme!='https' or parsed.hostname not in ALLOWED_IMAGES or parsed.username or parsed.password:
+        return ''
+    return value
+
+def project_summary(p):
+    if not isinstance(p,dict):return None
+    logo=p.get('logo') if isinstance(p.get('logo'),dict) else {}
+    links=p.get('links') if isinstance(p.get('links'),dict) else {}
+    return {
+      'id':p.get('id'),
+      'name':str(p.get('name',''))[:160],
+      'summary':str(p.get('summary',''))[:1200],
+      'downloads':p.get('downloadCount',0),
+      'slug':str(p.get('slug',''))[:120],
+      'icon':safe_image(logo.get('thumbnailUrl') or logo.get('url')),
+      'authors':[str(x.get('name',''))[:80] for x in p.get('authors',[])[:5] if isinstance(x,dict)],
+      'website':links.get('websiteUrl','') if isinstance(links.get('websiteUrl'),str) else ''
+    }
+
+def versions():
+    # CurseForge can return an empty /minecraft/version list even for an
+    # authenticated account; the game-scoped endpoint is an alternative.
+    first=api('minecraft/version',{'sortDescending':'true'})
+    out=[]
+    for item in first.get('data',[]):
+        if not isinstance(item,dict) or item.get('approved') is False:continue
+        v=item.get('versionString')
+        if minecraft_version(v) and v not in out:out.append(v)
+    if out:return out[:200]
+
+    # Official game-version endpoint groups versions by type. Filter out
+    # loader labels (Fabric/Forge/etc), snapshots and non-release strings.
+    grouped=api('games/'+str(MC_GAME_ID)+'/versions').get('data',[])
+    for group in grouped:
+        if not isinstance(group,dict):continue
+        for value in group.get('versions',[]):
+            if minecraft_version(value) and value not in out:
+                out.append(value)
+    return sorted(out,key=lambda v:tuple(int(p) for p in v.split('.')),reverse=True)[:200]
+
+def diagnose():
+    """Return counts and HTTP errors, never authentication headers or key."""
+    result={'key_file_configured':KEY.is_file() and not KEY.is_symlink()}
+    for name,path,params in (
+        ('minecraft_versions','minecraft/version',{'sortDescending':'true'}),
+        ('game_versions','games/'+str(MC_GAME_ID)+'/versions',None),
+        ('mod_search','mods/search',{'gameId':MC_GAME_ID,'classId':4471,'pageSize':1,'searchFilter':'All the Mods'}),
+    ):
+        try:
+            body=api(path,params)
+            data=body.get('data')
+            result[name]={'response_type':type(data).__name__,
+                          'items':len(data) if isinstance(data,list) else None}
+        except Exception as exc:
+            # Expose only exception type/status; not request payloads.
+            result[name]={'error_type':type(exc).__name__,
+                          'http_status':getattr(exc,'code',None)}
+    return result
+
+def _search_rank(project,query):
+    """Prioritize full title matches over loosely related API results."""
+    words=re.findall(r'[a-z0-9]+',query.casefold())
+    name=str(project.get('name','')).casefold()
+    slug=str(project.get('slug','')).casefold()
+    normalized=re.sub(r'[^a-z0-9]+',' ',name).strip()
+    compact=re.sub(r'[^a-z0-9]+','',name)
+    wanted=' '.join(words)
+    wanted_compact=''.join(words)
+    pwords=normalized.split()
+    phrase=bool(wanted and wanted in normalized)
+    prefix=bool(wanted and normalized.startswith(wanted))
+    exact=bool(wanted and normalized==wanted)
+    slug_hit=bool(wanted_compact and wanted_compact in re.sub(r'[^a-z0-9]','',slug))
+    all_words=bool(words and all(w in pwords for w in words))
+    ordered=bool(words and all(w in normalized for w in words))
+    return (int(exact),int(prefix),int(phrase),int(slug_hit),
+            int(all_words),int(ordered),sum(w in pwords for w in words),
+            int(wanted_compact==compact),int(project.get('downloads') or 0))
+
+SORTS={'relevance':13,'featured':1,'popular':2,'updated':3,'name':4,'downloads':6,'released':11,'rating':12}
+LOADERS={'any':0,'forge':1,'cauldron':2,'liteloader':3,'fabric':4,'quilt':5,'neoforge':6}
+CLASSES={'modpacks':4471,'mods':6}
+
+def categories(category):
+    if category not in CLASSES:raise ValueError('Unknown CurseForge section')
+    class_id=CLASSES[category]
+    records=api('categories',{'gameId':MC_GAME_ID,'classId':class_id}).get('data',[])
+    options=[]
+    seen=set()
+    for record in records:
+        if not isinstance(record,dict):continue
+        cid=record.get('id')
+        if type(cid)!=int or cid<=0 or cid in seen:continue
+        if record.get('isClass') or record.get('classId') not in (None,class_id):continue
+        seen.add(cid)
+        options.append({'id':cid,'name':str(record.get('name',''))[:80],
+                        'parent':record.get('parentCategoryId'),
+                        'display_index':record.get('displayIndex',999)})
+    return sorted(options,key=lambda c:(c['display_index'],c['name'].casefold()))[:150]
+
+def search_page(query,category,version,category_id='',sort='relevance',loader='any',index='0'):
+    if not isinstance(query,str) or len(query)>90 or len(version)>30:
+        raise ValueError('Search too long')
+    if category not in CLASSES:raise ValueError('Invalid search category')
+    if version and not minecraft_version(version):raise ValueError('Invalid Minecraft version')
+    if sort not in SORTS:raise ValueError('Unsupported sort order')
+    if loader not in LOADERS:raise ValueError('Unsupported loader')
+    if loader!='any' and not version:
+        raise ValueError('Select a Minecraft version before filtering by loader')
+    try:offset=int(index)
+    except (ValueError,TypeError):raise ValueError('Invalid page index') from None
+    if not 0<=offset<=9950 or offset%20:
+        raise ValueError('Invalid search page index')
+    params={'gameId':MC_GAME_ID,'classId':CLASSES[category],
+            'sortField':SORTS[sort],'sortOrder':'asc' if sort=='name' else 'desc',
+            'index':offset,'pageSize':20}
+    if query.strip():params['searchFilter']=query.strip()
+    if version:params['gameVersion']=version
+    if loader!='any':params['modLoaderType']=LOADERS[loader]
+    if category_id:
+        try:cid=int(category_id)
+        except (TypeError,ValueError):raise ValueError('Invalid category ID') from None
+        # Verify the requested category is published within the selected section.
+        if cid not in {c['id'] for c in categories(category)}:
+            raise ValueError('Invalid category for the selected section')
+        params['categoryId']=cid
+    response=api('mods/search',params)
+    items=[item for p in response.get('data',[]) if (item:=project_summary(p)) is not None]
+    # Only apply title boosting to the default relevance mode. User-chosen
+    # download/popularity/date sorts keep the authoritative API order.
+    if sort=='relevance' and query.strip():
+        items.sort(key=lambda p:_search_rank(p,query),reverse=True)
+    paging=response.get('pagination') or {}
+    total=paging.get('totalCount')
+    has_more=bool(total is not None and offset+len(items)<total)
+    if total is None:has_more=len(items)==20 and offset+20<10000
+    return {'items':items,'total':total if isinstance(total,int) else None,
+            'index':offset,'next_index':offset+20 if has_more else None}
+
+def search(query,category,version):
+    # Keep the existing command contract for older deployments and tests.
+    return search_page(query,category,version)['items']
+
+
+def files(project_id):
+    pid=int(project_id)
+    if not 0<pid<2**31:raise ValueError('Invalid project ID')
+    data=api('mods/'+str(pid)+'/files',{'pageSize':50}).get('data',[])
+    return [{
+      'id':x.get('id'),
+      'name':str(x.get('displayName') or x.get('fileName',''))[:180],
+      'file_name':str(x.get('fileName',''))[:180],
+      'game_versions':[v for v in x.get('gameVersions',[])[:24] if isinstance(v,str)],
+      'release_type':x.get('releaseType'),
+      'file_length':x.get('fileLength',0),
+      'server_pack_id':x.get('serverPackFileId'),
+      'is_server_pack':x.get('isServerPack',False)
+    } for x in data[:50] if isinstance(x,dict)]
+
+def project(project_id):
+    # Keep the initial Details button responsive: one API request only.
+    pid=int(project_id)
+    if not 0<pid<2**31:raise ValueError('Invalid project ID')
+    data=project_summary(api('mods/'+str(pid)).get('data',{}))
+    if not data or int(data['id'] or 0)!=pid:raise ValueError('Project not found')
+    return data
+
+def project_description(project_id):
+    pid=int(project_id)
+    if not 0<pid<2**31:raise ValueError('Invalid project ID')
+    # Plain text is displayed in a bounded, scrollable region on the client.
+    return {'description':str(api('mods/'+str(pid)+'/description',
+                                   {'stripped':'true'}).get('data',''))[:4000]}
+
+
+def _server_name(value):
+    if not isinstance(value,str) or not re.fullmatch(r'[a-z][a-z0-9-]{1,34}',value):
+        raise ValueError('Server name must be 2-35 lowercase characters, starting with a letter')
+    if value=='neoforge':raise ValueError('The legacy NeoForge server name is reserved')
+    return value
+
+def server_plan(project_id,file_id,name,directory,ram_gib,cpu_cores,port,
+                repository,schedule,interval,restore_export,eula):
+    """Read-only setup preview. No world, service, backup or filesystem writes."""
+    import os
+    import pathlib
+    pid=int(project_id);fid=int(file_id)
+    if not (0<pid<2**31 and 0<fid<2**31):raise ValueError('Invalid CurseForge project/file selection')
+    name=_server_name(name)
+    ram=int(ram_gib);cpu=int(cpu_cores);port=int(port);interval=int(interval)
+    if not 2<=ram<=64:raise ValueError('RAM must be 2–64 GiB')
+    available_cpus=os.cpu_count() or 1
+    if not 1<=cpu<=available_cpus:raise ValueError('CPU cores must be between 1 and '+str(available_cpus))
+    if port!=0 and not 1024<=port<=65535:raise ValueError('Port must be 0 or 1024–65535')
+    if schedule not in ('off','hourly','6hours','12hours','daily','weekly','custom'):
+        raise ValueError('Unsupported backup schedule')
+    if not 15<=interval<=10080:raise ValueError('Backup interval must be 15–10080 minutes')
+    if eula not in ('true','false'):raise ValueError('Invalid Minecraft EULA acknowledgement')
+
+    destination=pathlib.Path(directory.strip() or '/opt/minecraft/managed/'+name)
+    if not destination.is_absolute() or '..' in destination.parts or destination.name!=name:
+        raise ValueError('Choose an absolute server folder ending in the server name; no .. segments')
+    if not (str(destination).startswith('/opt/minecraft/managed/') or
+            str(destination).startswith('/srv/minecraft/') or
+            str(destination).startswith('/mnt/')):
+        raise ValueError('Choose a directory under /opt/minecraft/managed, /srv/minecraft, or /mnt')
+    warnings=[]
+    for ancestor in (destination,*destination.parents):
+        if ancestor.is_symlink():raise ValueError('The installation path contains a symlink')
+    if destination.exists():raise ValueError('The server destination already exists')
+    if not destination.parent.is_dir():
+        warnings.append('Create and mount the destination parent directory before installation')
+    if str(destination).startswith('/mnt/'):
+        warnings.append('Confirm this mount is an appropriate Linux filesystem with systemd and file ownership support')
+    registered=pathlib.Path('/etc/cockpit-minecraft/servers.json')
+    if registered.is_file() and not registered.is_symlink():
+        try: registry=json.loads(registered.read_text())
+        except (ValueError,OSError):raise ValueError('Existing server registry cannot be read safely')
+        if not isinstance(registry,dict):raise ValueError('Invalid existing server registry')
+        if name in registry:raise ValueError('A server with this name already exists')
+        for entry in registry.values():
+            if not isinstance(entry,dict) or not isinstance(entry.get('path'),str):continue
+            other=pathlib.Path(entry['path'])
+            if other==destination or destination in other.parents or other in destination.parents:
+                raise ValueError('The requested directory overlaps another managed server')
+    if pathlib.Path('/etc/systemd/system/mc-managed-'+name+'.service').exists():
+        raise ValueError('A systemd unit with this name already exists')
+
+    repo=repository.strip();export=restore_export.strip()
+    if repo and not pathlib.Path(repo).is_absolute():raise ValueError('Backup repository path must be absolute')
+    if export and (not pathlib.Path(export).is_absolute() or '..' in pathlib.Path(export).parts):
+        raise ValueError('Restore export path must be absolute without ..')
+    if schedule!='off' and not repo:
+        raise ValueError('Enter an existing Restic repository for automatic backups')
+    if schedule!='off':
+        warnings.append('Backup configuration requires separately validating Restic access and backup timers')
+    if export: warnings.append('Restore export folder must be empty and must not overlap any server or backup repository')
+
+    metadata=api('mods/'+str(pid)+'/files/'+str(fid)).get('data',{})
+    if not isinstance(metadata,dict) or metadata.get('id')!=fid or metadata.get('modId')!=pid:
+        raise ValueError('The release file does not belong to the selected CurseForge project')
+    versions=[str(v) for v in metadata.get('gameVersions',[]) if isinstance(v,str) and minecraft_version(v)]
+    server_pack_id=metadata.get('serverPackFileId')
+    is_server_pack=bool(metadata.get('isServerPack'))
+    if not server_pack_id and not is_server_pack:
+        warnings.append('This release is not identified as a server pack; a client modpack cannot directly run as a server')
+    warnings.extend([
+      'CurseForge metadata alone does not prove this release is a runnable Java server.',
+      'NeoForge/Forge installers and automatic dependency downloading are not implemented.',
+      'The server creation operation is not yet enabled; this is a configuration preview only.'
+    ])
+    return {
+       'mode':'review-only','create_enabled':False,
+       'project_id':pid,'file_id':fid,'file_name':str(metadata.get('displayName') or metadata.get('fileName') or '')[:180],
+       'server_pack_file_id':server_pack_id,'is_server_pack':is_server_pack,
+       'game_versions':versions[:16],
+       'server_id':name,'path':str(destination),'port':'automatic' if port==0 else port,
+       'ram_gib':ram,'cpu_cores':cpu,'system_cpu_cores':available_cpus,
+       'backup':{'schedule':schedule,'repository':repo or None,'interval_minutes':interval,
+                 'restore_export':export or None},
+       'eula_accepted':eula=='true','warnings':warnings,
+       'next_step':'Obtain and validate an official server pack before enabling service creation; no files were changed.'
+    }
+
+def main(args):
+    if not args:raise ValueError('Operation required')
+    op,*rest=args
+    if op=='versions' and not rest:return versions()
+    if op=='diagnose' and not rest:return diagnose()
+    if op=='search' and len(rest)==3:return search(*rest)
+    if op=='search-page' and len(rest)==7:return search_page(*rest)
+    if op=='categories' and len(rest)==1:return categories(rest[0])
+    if op=='project' and len(rest)==1:return project(rest[0])
+    if op=='description' and len(rest)==1:return project_description(rest[0])
+    if op=='files' and len(rest)==1:return files(rest[0])
+    if op=='server-plan' and len(rest)==12:return server_plan(*rest)
+    raise ValueError('Unsupported browser operation')
+
+if __name__=='__main__':
+    try:
+        if os.geteuid()!=0:raise PermissionError('Administrative access required')
+        print(json.dumps({'ok':True,'data':main(sys.argv[1:])}))
+    except Exception as exc:
+        print(json.dumps({'ok':False,'error':str(exc)[:300]}))

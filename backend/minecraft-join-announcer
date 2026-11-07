@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Monitor configured Minecraft systemd journal and send local RCON announcements."""
+import json
+import logging
+import re
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CONFIG = Path("/etc/minecraft-join-announcer.json")
+STOP = False
+JOIN = re.compile(r"(?:System chat:\s*)?(?P<name>[A-Za-z0-9_]{3,16}) joined the game\s*$")
+LEAVE = re.compile(r"(?:System chat:\s*)?(?P<name>[A-Za-z0-9_]{3,16}) left the game\s*$")
+
+def stopping(*_):
+    global STOP
+    STOP = True
+
+def read_props(path):
+    props = {}
+    for line in Path(path).read_text().splitlines():
+        item = line.strip()
+        if item and not item.startswith(("#", "!")) and "=" in item:
+            key, value = item.split("=", 1)
+            props[key.strip()] = value.strip()
+    return props
+
+def receive_exact(sock, size):
+    data = bytearray()
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise ConnectionError("RCON connection closed")
+        data.extend(chunk)
+    return bytes(data)
+
+def receive_packet(sock):
+    length = struct.unpack("<i", receive_exact(sock, 4))[0]
+    if not 10 <= length <= 4096:
+        raise ValueError("Invalid RCON packet length")
+    data = receive_exact(sock, length)
+    return struct.unpack("<ii", data[:8]) + (data[8:-2],)
+
+def send_packet(sock, request_id, kind, payload):
+    body = struct.pack("<ii", request_id, kind) + payload.encode() + b"\0\0"
+    sock.sendall(struct.pack("<i", len(body)) + body)
+
+def announce(config, message):
+    props = read_props(config["properties"])
+    if props.get("enable-rcon", "").lower() != "true":
+        raise RuntimeError("RCON disabled")
+    password = props.get("rcon.password")
+    if not password:
+        raise RuntimeError("RCON password missing")
+    port = int(props.get("rcon.port", "25575"))
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
+        sock.settimeout(3)
+        send_packet(sock, 101, 3, password)
+        response = receive_packet(sock)
+        if response[0] == -1:
+            raise RuntimeError("RCON authentication rejected")
+        if response[0] != 101:
+            response = receive_packet(sock)
+        if response[0] != 101:
+            raise RuntimeError("Unexpected RCON authentication result")
+        command = "tellraw @a " + json.dumps({"text": message, "color": config.get("color", "gold")}, ensure_ascii=False)
+        send_packet(sock, 102, 2, command)
+        receive_packet(sock)
+
+def run(config):
+    unit = config["unit"]
+    if not re.fullmatch(r"[A-Za-z0-9_.@-]+\.service", unit):
+        raise ValueError("Invalid service name")
+    recent = {}
+    while not STOP:
+        follower = subprocess.Popen(
+            ["journalctl", "--no-pager", "-f", "-n", "0", "-o", "cat", "-u", unit],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        try:
+            for line in follower.stdout:
+                if STOP:
+                    break
+                event = JOIN.search(line.rstrip()) or LEAVE.search(line.rstrip())
+                if not event:
+                    continue
+                name = event.group("name")
+                action = "join" if JOIN.search(line.rstrip()) else "leave"
+                timestamp = time.monotonic()
+                if timestamp - recent.get((name, action), -9999) < 3:
+                    continue
+                recent[(name, action)] = timestamp
+                default = "✦ {player} joined!" if action == "join" else "✦ {player} left!"
+                template = config.get(action + "_message", default)
+                try:
+                    announce(config, template.replace("{player}", name))
+                except Exception as exc:
+                    logging.warning("Failed %s message for %s: %s", action, name, exc)
+        finally:
+            follower.terminate()
+            try:
+                follower.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                follower.kill()
+        if not STOP:
+            time.sleep(2)
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    signal.signal(signal.SIGTERM, stopping)
+    signal.signal(signal.SIGINT, stopping)
+    try:
+        run(json.loads(CONFIG.read_text()))
+    except Exception as exc:
+        logging.error("Announcer failure: %s", exc)
+        sys.exit(1)
