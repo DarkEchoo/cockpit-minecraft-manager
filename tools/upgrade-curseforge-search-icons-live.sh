@@ -71,7 +71,8 @@ if header in current:
     start=current.index(header)
     existing=current[start:].rstrip()
     previous=suffix.split('/* CurseForge numbered pagination */')[0].rstrip()
-    if existing not in (previous,suffix.rstrip()):
+    pagination=suffix.split('/* CurseForge server setup wizard')[0].rstrip()
+    if existing not in (previous,pagination,suffix.rstrip()):
         raise ValueError('Existing enhanced browser styles have been customized')
     result=current[:start].rstrip()+'\n\n'+suffix
 else:
