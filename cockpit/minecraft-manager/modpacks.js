@@ -62,8 +62,9 @@
  ratedBtn.type='button';
  const clearBtn=el('button','btn secondary','Reset filters');
  clearBtn.type='button';
- const loadMore=el('button','btn secondary','Load more results');
- loadMore.type='button';loadMore.hidden=true;
+ const pagination=el('nav','mp-browser-pagination');
+ pagination.setAttribute('aria-label','CurseForge search pages');
+ pagination.hidden=true;
  const countText=el('p','hint');
  const searchPanel=searchBtn.parentElement;
  searchPanel.insertBefore(filters,searchBtn);
@@ -71,8 +72,8 @@
  controls.classList.add('mp-browser-presets');
  controls.append(topBtn,popularBtn,featuredBtn,updatedBtn,releasedBtn,ratedBtn,clearBtn);
  searchPanel.insertBefore(countText,resultsPanel);
- resultsPanel.after(loadMore);
- let activeSearch=0,activeDetails=0,nextPage=null,searchBusy=false,displayedCount=0,activeCard=null;
+ resultsPanel.after(pagination);
+ let activeSearch=0,activeDetails=0,searchBusy=false,activeCard=null,currentPage=1,totalPages=1,hasMore=false;
  const loadVersions=async()=>{
    try{
      const values=await browse('versions');
@@ -117,30 +118,59 @@
    item.append(detail);
    resultsPanel.append(item);
  };
- const search=async(more=false)=>{
+ const maxPage=498; // Backend limits the search offset to 9940 (20 items/page).
+ const drawPages=()=>{
+   pagination.replaceChildren();
+   if(totalPages<=1&&!hasMore){pagination.hidden=true;return;}
+   pagination.hidden=false;
+   const button=(label,page,disabled=false,current=false)=>{
+     const btn=el('button','btn secondary',label);btn.type='button';
+     btn.disabled=disabled||searchBusy;btn.setAttribute('aria-label',label==='Previous'||label==='Next'?label+' page':'Page '+page);
+     if(current){btn.classList.add('mp-page-current');btn.setAttribute('aria-current','page');}
+     btn.onclick=()=>search(page);
+     pagination.append(btn);
+   };
+   button('Previous',currentPage-1,currentPage<=1);
+   const knownEnd=Math.min(maxPage,Math.max(totalPages,currentPage+(hasMore?1:0)));
+   const selected=new Set([1,knownEnd]);
+   for(let p=Math.max(1,currentPage-2);p<=Math.min(knownEnd,currentPage+2);p++)selected.add(p);
+   let last=0;
+   for(const p of [...selected].sort((x,y)=>x-y)){
+     if(p>last+1)pagination.append(el('span','mp-page-ellipsis','…'));
+     button(String(p),p,false,p===currentPage);last=p;
+   }
+   button('Next',currentPage+1,currentPage>=knownEnd||!hasMore);
+ };
+ const search=async(page=1)=>{
    if(searchBusy)return;
    const values=readFilters();
    if(values[5]!=='any'&&!values[2]){countText.textContent='Choose a Minecraft version to filter by mod loader.';return;}
+   if(!Number.isInteger(page)||page<1||page>maxPage)return;
    const requestId=++activeSearch;
-   const offset=more?nextPage:0;
-   if(more&&offset===null)return;
-   searchBusy=true;searchBtn.disabled=true;loadMore.disabled=true;
-   countText.textContent=more?'Loading more results…':'Searching CurseForge…';
-   if(!more){activeDetails++;activeCard=null;resultsPanel.replaceChildren();detailPanel.remove();detailPanel.hidden=true;nextPage=null;loadMore.hidden=true;displayedCount=0;}
+   searchBusy=true;searchBtn.disabled=true;
+   const priorPage=currentPage;
+   countText.textContent='Loading page '+page+'…';
+   activeDetails++;activeCard=null;detailPanel.remove();detailPanel.hidden=true;
+   resultsPanel.replaceChildren();pagination.hidden=true;
    try{
      const sort=values[4]==='relevance'&&!values[0].trim()?'popular':values[4];
-     const data=await browse('search-page',...values.slice(0,4),sort,values[5],String(offset));
+     const data=await browse('search-page',...values.slice(0,4),sort,values[5],String((page-1)*20));
      if(requestId!==activeSearch)return;
-     for(const project of data.items||[]){showCard(project);displayedCount++;}
-     nextPage=data.next_index;
-     loadMore.hidden=nextPage===null||nextPage===undefined;
-     countText.textContent=displayedCount+' shown'+(data.total!==null&&data.total!==undefined?' of '+Number(data.total).toLocaleString():'')+
-       '. Sorting and filters are applied by CurseForge.';
-   }catch(e){countText.textContent='Search failed: '+String(e.message||e);}
-   finally{searchBusy=false;searchBtn.disabled=false;loadMore.disabled=false;}
+     for(const project of data.items||[])showCard(project);
+     currentPage=page;
+     const hasTotal=Number.isInteger(data.total)&&data.total>=0;
+     totalPages=hasTotal?Math.max(1,Math.min(maxPage,Math.ceil(data.total/20))):Math.max(page,1);
+     hasMore=data.next_index!==null&&data.next_index!==undefined;
+     const shown=(data.items||[]).length;
+     const first=shown?(page-1)*20+1:0;
+     const last=(page-1)*20+shown;
+     countText.textContent=shown?'Showing '+first+'–'+last+
+       (hasTotal?' of '+Number(data.total).toLocaleString():'')+' results · Page '+page+
+       (hasTotal?' of '+totalPages:''):'No projects found on page '+page+'.';
+   }catch(e){currentPage=priorPage;countText.textContent='Search failed: '+String(e.message||e);}
+   finally{searchBusy=false;searchBtn.disabled=false;drawPages();}
  };
- searchBtn.onclick=()=>search();
- loadMore.onclick=()=>search(true);
+ searchBtn.onclick=()=>search(1);
  queryInput.addEventListener('keydown',e=>{if(e.key==='Enter')search();});
  const quickSort=sort=>{sortFilter.value=sort;search();};
  topBtn.onclick=()=>quickSort('downloads');
