@@ -101,15 +101,41 @@ def diagnose():
                           'http_status':getattr(exc,'code',None)}
     return result
 
+def _search_rank(project,query):
+    """Prioritize full title matches over loosely related API results."""
+    words=re.findall(r'[a-z0-9]+',query.casefold())
+    name=str(project.get('name','')).casefold()
+    slug=str(project.get('slug','')).casefold()
+    normalized=re.sub(r'[^a-z0-9]+',' ',name).strip()
+    compact=re.sub(r'[^a-z0-9]+','',name)
+    wanted=' '.join(words)
+    wanted_compact=''.join(words)
+    pwords=normalized.split()
+    phrase=bool(wanted and wanted in normalized)
+    prefix=bool(wanted and normalized.startswith(wanted))
+    exact=bool(wanted and normalized==wanted)
+    slug_hit=bool(wanted_compact and wanted_compact in re.sub(r'[^a-z0-9]','',slug))
+    all_words=bool(words and all(w in pwords for w in words))
+    ordered=bool(words and all(w in normalized for w in words))
+    return (int(exact),int(prefix),int(phrase),int(slug_hit),
+            int(all_words),int(ordered),sum(w in pwords for w in words),
+            int(wanted_compact==compact),int(project.get('downloads') or 0))
+
 def search(query,category,version):
     if len(query)>90 or len(version)>30:raise ValueError('Search too long')
     if category not in ('modpacks','mods'):raise ValueError('Invalid search category')
     if version and not minecraft_version(version):raise ValueError('Invalid game version')
     params={'gameId':MC_GAME_ID,'classId':4471 if category=='modpacks' else 6,
-            'searchFilter':query,'pageSize':20}
+            'searchFilter':query,'pageSize':50}
+    if query.strip():
+        # CurseForge Core API: 13 = Relevancy; response ranking is supplemented
+        # by exact title/prefix matching so popular unrelated packs do not dominate.
+        params.update({'sortField':13,'sortOrder':'desc'})
     if version:params['gameVersion']=version
     data=api('mods/search',params).get('data',[])
-    return [item for p in data if (item:=project_summary(p)) is not None]
+    items=[item for p in data if (item:=project_summary(p)) is not None]
+    if query.strip():items.sort(key=lambda p:_search_rank(p,query),reverse=True)
+    return items[:30]
 
 def files(project_id):
     pid=int(project_id)
