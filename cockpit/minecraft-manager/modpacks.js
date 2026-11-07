@@ -204,6 +204,7 @@
    }
  };
  loadVersions();
+ loadCategories();
  $m('mp-new').onclick=()=>run('Create custom modpack manifest',async()=>{const r=await call('create-manifest',$m('mp-name').value,$m('mp-version').value,$m('mp-loader').value);await update();return r});
  $m('mp-import').onclick=async()=>{
    const file=$m('mp-zip').files[0];if(!file)return say('Choose a ZIP file first.',true);
