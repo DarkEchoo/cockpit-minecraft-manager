@@ -26,7 +26,7 @@
  const versionSelect=$m('mp-search-version');
  const detailPanel=$m('mp-project-detail');
  const el=(tag,cls,text)=>{const node=document.createElement(tag);if(cls)node.className=cls;if(text!==undefined)node.textContent=String(text);return node;};
- const safeUrl=(url)=>{try{const u=new URL(url);return u.protocol==='https:'&&['media.forgecdn.net','mediafilez.forgecdn.net','edge.forgecdn.net','media.curseforge.com'].includes(u.hostname)?u.href:'';}catch{return '';}};
+ const safeUrl=(url)=>{try{const u=new URL(url);return u.protocol==='https:'&&['media.forgecdn.net','mediafilez.forgecdn.net','edge.forgecdn.net','media.curseforge.com','static-cdn.jtvnw.net'].includes(u.hostname)?u.href:'';}catch{return '';}};
  const mcVersion=v=>/^\\d+(?:\\.\\d+){1,3}$/.test(v);
  const loadVersions=async()=>{
    try{
@@ -48,7 +48,7 @@
      const headingRow=el('div','');
      headingRow.className='mp-browser-project-heading';
      const art=safeUrl(d.icon);
-     if(art){const img=el('img');img.src=art;img.alt=d.name+' icon';img.loading='lazy';img.width=80;img.height=80;img.className='mp-browser-icon';headingRow.append(img);}
+     if(art){const img=el('img');img.src=art;img.alt=d.name+' icon';img.loading='lazy';img.width=80;img.height=80;img.className='mp-browser-icon';img.referrerPolicy='no-referrer';headingRow.append(img);}
      const info=el('div');info.append(heading,summary);headingRow.append(info);
      detailPanel.append(headingRow);
      if(d.authors?.length)detailPanel.append(el('p','hint','By '+d.authors.join(', ')));
