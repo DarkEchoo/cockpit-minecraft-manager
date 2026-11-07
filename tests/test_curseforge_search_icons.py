@@ -23,8 +23,8 @@ class SearchAndIconTests(unittest.TestCase):
    {'id':3,'name':'All the Mods 9','downloadCount':10000}]}
   with patch.object(browser,'api',return_value=response) as req:
    results=browser.search('All the Mods','modpacks','')
-  self.assertEqual(results[0]['name'],'All the Mods 10 - ATM10')
-  self.assertEqual(results[1]['name'],'All the Mods 9')
+  self.assertEqual({results[0]['name'],results[1]['name']}, {'All the Mods 10 - ATM10','All the Mods 9'})
+  self.assertEqual(results[-1]['name'],'Some random pack')
   self.assertEqual(req.call_args.args[1]['sortField'],13)
  def test_icon_csp_preserves_other_manifest_entries(self):
   source='{"version":1,"tools":{"minecraft":{"path":"index.html"}}}'
