@@ -55,6 +55,26 @@ stage="$(mktemp -d /tmp/mc-curseforge-upgrade.XXXXXXXX)"
 trap 'rm -rf -- "$stage"' EXIT
 python3 "$ROOT/tools/patch-live-curseforge-manifest.py" "$FRONT/manifest.json" "$stage/manifest.json" ||
   die 'Custom Cockpit image policy requires manual review; no changes made'
+# Preserve any local styles. Only append the dedicated browser enhancement
+# block from the packaged CSS; never replace the full live stylesheet.
+python3 - "$ROOT/cockpit/minecraft-manager/styles.css" "$FRONT/styles.css" "$stage/styles.css" <<'PY'
+from pathlib import Path
+import sys
+package,live,out=map(Path,sys.argv[1:])
+header='/* Expanded CurseForge discovery and inline project details */'
+pack=package.read_text()
+current=live.read_text()
+if pack.count(header)!=1:
+    raise ValueError('Missing or ambiguous packaged browser styles')
+suffix=pack[pack.index(header):]
+if header in current:
+    if current[current.index(header):]!=suffix:
+        raise ValueError('Existing enhanced browser styles have been customized')
+    result=current
+else:
+    result=current.rstrip()+'\\n\\n'+suffix
+out.write_text(result)
+PY
 backup="$(mktemp -d /var/backups/cockpit-minecraft-search-icons.XXXXXXXX)"
 chmod 700 "$backup"
 : > "$backup/manifest.txt"
@@ -73,7 +93,7 @@ trap failed ERR
 install -o root -g root -m 644 "$ROOT/cockpit/minecraft-manager/modpacks.js" "$FRONT/modpacks.js"
 install -o root -g root -m 755 "$ROOT/backend/$BR" "$BACK/$BR"
 install -o root -g root -m 644 "$stage/manifest.json" "$FRONT/manifest.json"
-install -o root -g root -m 644 "$ROOT/cockpit/minecraft-manager/styles.css" "$FRONT/styles.css"
+install -o root -g root -m 644 "$stage/styles.css" "$FRONT/styles.css"
 trap - ERR
 echo 'CurseForge browser, inline detail styling and image permissions updated; no Minecraft services changed.'
 echo "Rollback: sudo bash '$ROOT/tools/upgrade-curseforge-search-icons-live.sh' --rollback '$backup'"
