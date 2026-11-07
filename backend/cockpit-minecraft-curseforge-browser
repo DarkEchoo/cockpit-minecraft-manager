@@ -62,13 +62,44 @@ def project_summary(p):
     }
 
 def versions():
-    data=api('minecraft/version',{'sortDescending':'true'}).get('data',[])
+    # CurseForge can return an empty /minecraft/version list even for an
+    # authenticated account; the game-scoped endpoint is an alternative.
+    first=api('minecraft/version',{'sortDescending':'true'})
     out=[]
-    for item in data:
-        if not isinstance(item,dict) or not item.get('approved'):continue
+    for item in first.get('data',[]):
+        if not isinstance(item,dict) or item.get('approved') is False:continue
         v=item.get('versionString')
         if minecraft_version(v) and v not in out:out.append(v)
-    return out[:200]
+    if out:return out[:200]
+
+    # Official game-version endpoint groups versions by type. Filter out
+    # loader labels (Fabric/Forge/etc), snapshots and non-release strings.
+    grouped=api('games/'+str(MC_GAME_ID)+'/versions').get('data',[])
+    for group in grouped:
+        if not isinstance(group,dict):continue
+        for value in group.get('versions',[]):
+            if minecraft_version(value) and value not in out:
+                out.append(value)
+    return sorted(out,key=lambda v:tuple(int(p) for p in v.split('.')),reverse=True)[:200]
+
+def diagnose():
+    """Return counts and HTTP errors, never authentication headers or key."""
+    result={'key_file_configured':KEY.is_file() and not KEY.is_symlink()}
+    for name,path,params in (
+        ('minecraft_versions','minecraft/version',{'sortDescending':'true'}),
+        ('game_versions','games/'+str(MC_GAME_ID)+'/versions',None),
+        ('mod_search','mods/search',{'gameId':MC_GAME_ID,'classId':4471,'pageSize':1,'searchFilter':'All the Mods'}),
+    ):
+        try:
+            body=api(path,params)
+            data=body.get('data')
+            result[name]={'response_type':type(data).__name__,
+                          'items':len(data) if isinstance(data,list) else None}
+        except Exception as exc:
+            # Expose only exception type/status; not request payloads.
+            result[name]={'error_type':type(exc).__name__,
+                          'http_status':getattr(exc,'code',None)}
+    return result
 
 def search(query,category,version):
     if len(query)>90 or len(version)>30:raise ValueError('Search too long')
@@ -114,6 +145,7 @@ def main(args):
     if not args:raise ValueError('Operation required')
     op,*rest=args
     if op=='versions' and not rest:return versions()
+    if op=='diagnose' and not rest:return diagnose()
     if op=='search' and len(rest)==3:return search(*rest)
     if op=='project' and len(rest)==1:return project(rest[0])
     if op=='files' and len(rest)==1:return files(rest[0])
