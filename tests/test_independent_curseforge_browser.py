@@ -16,6 +16,21 @@ class IndependentBrowserTests(unittest.TestCase):
   response={'data':[{'approved':True,'versionString':'1.21.1'},{'approved':True,'versionString':'1.20.1'},{'approved':False,'versionString':'9.9'}]}
   with patch.object(browser,'api',return_value=response):
    self.assertEqual(browser.main(['versions']),['1.21.1','1.20.1'])
+ def test_fallback_versions_when_minecraft_endpoint_is_empty(self):
+  def endpoint(path, params=None):
+   if path=='minecraft/version':return {'data':[]}
+   if path=='games/432/versions':
+    return {'data':[{'type':1,'versions':['1.20.1','Fabric','1.21.1','24w06a','1.21.1']}]}
+   raise AssertionError(path)
+  with patch.object(browser,'api',side_effect=endpoint):
+   self.assertEqual(browser.main(['versions']),['1.21.1','1.20.1'])
+ def test_diagnose_only_shows_counts_not_credentials(self):
+  def endpoint(path,params=None):
+   return {'data':[{'id':1,'name':'Private data not returned'}]}
+  with patch.object(browser,'api',side_effect=endpoint),patch.object(browser.KEY,'is_file',return_value=True),patch.object(browser.KEY,'is_symlink',return_value=False):
+   result=browser.main(['diagnose'])
+  self.assertEqual(result['mod_search']['items'],1)
+  self.assertNotIn('Private data',str(result))
  def test_restrict_icon_origin(self):
   self.assertEqual(browser.safe_image('https://example.com/x.png'),'')
   self.assertEqual(browser.safe_image('https://media.forgecdn.net/p.png'),'https://media.forgecdn.net/p.png')
