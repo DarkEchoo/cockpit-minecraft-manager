@@ -39,6 +39,7 @@ jobs:
           done
           bash -n install.sh
           bash -n tools/deploy-curseforge-browser-live.sh
+          bash -n tools/upgrade-curseforge-search-icons-live.sh
       - name: Frontend JavaScript syntax
         run: |
           for file in cockpit/minecraft-manager/*.js addons/backup-manager/cockpit/*.js; do
