@@ -56,7 +56,7 @@ The installer finds its project files relative to its own location; your working
 bash "/path/to/extracted release/install.sh" --check
 ```
 
-The v1.2 development branch currently supports read-only checks only. `--apply` is deliberately blocked until production upgrade and rollback validation is complete.
+The v1.2 release-candidate branch also supports a **gated, file-only** `--apply --accept` transaction, with rollback. This is **not** a complete installation on a clean Ubuntu machine. See [clean-host readiness and blockers](docs/FRESH_INSTALL_READINESS.md).
 
 ## Security and privacy
 
