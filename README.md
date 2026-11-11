@@ -58,6 +58,11 @@ bash "/path/to/extracted release/install.sh" --check
 
 The v1.2 release-candidate branch also supports a **gated, file-only** `--apply --accept` transaction, with rollback. This is **not** a complete installation on a clean Ubuntu machine. See [clean-host readiness and blockers](docs/FRESH_INSTALL_READINESS.md).
 
+
+## CurseForge API keys
+
+CurseForge browsing is an optional feature and **requires each installer to provide their own API key**. No API key is shipped in the public repository or frontend bundle. The existing backend reads it from the root-owned host file `/etc/cockpit-minecraft/curseforge-api-key` (mode `0600`). To configure it on a host without an existing key, review and run `sudo python3 tools/configure-curseforge-key.py`. Existing keys are left untouched unless `--replace` is explicitly supplied. See [the credential setup and security guide](docs/CURSEFORGE_API_KEY.md).
+
 ## Security and privacy
 
 Do not commit API keys, RCON credentials, Restic password files, `server.properties`, worlds, server logs, hostnames/IPs, or real server archives. Store any future CurseForge API key in root-readable host configuration rather than frontend JavaScript. Review [SECURITY.md](SECURITY.md).
