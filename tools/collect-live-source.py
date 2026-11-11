@@ -35,8 +35,8 @@ BACK_NAMES = {
 }
 # Conservative heuristic: manual review remains mandatory.
 SUSPECT = re.compile(
-    r"(?i)(?:password|passwd|secret|api[_-]?key|access[_-]?token|"
-    r"private[_-]?key|credential)[ \\t]*[:=][ \\t]*['\\\"][^'\\\"]{4,}"
+    r'''(?i)(?:password|passwd|secret|api[_-]?key|access[_-]?token|
+private[_-]?key|credential)[ ]*[:=][ ]*["'][^"']{4,}'''.replace("\n", "")
 )
 PRIVATE_KEY = re.compile(r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----")
 MAX_BYTES = 2_000_000
