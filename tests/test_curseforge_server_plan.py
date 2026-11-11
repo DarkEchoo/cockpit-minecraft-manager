@@ -18,7 +18,13 @@ class CurseForgeServerPlanTests(unittest.TestCase):
            cpu_cores='2',port='0',repository='',schedule='off',
            interval='1440',restore_export='',eula='true')
   cfg.update(changes)
-  with patch.object(browser,'api',return_value={'data':{'id':202,'modId':101,'fileName':'ATM10.zip',
+  # Isolate tests from the live root-owned registry. Other file checks are real.
+  original_is_file = Path.is_file
+  def isolated_is_file(path):
+   if str(path) == '/etc/cockpit-minecraft/servers.json':
+    return False
+   return original_is_file(path)
+  with patch.object(Path, 'is_file', new=isolated_is_file),patch.object(browser,'api',return_value={'data':{'id':202,'modId':101,'fileName':'ATM10.zip',
       'gameVersions':['1.21.1','NeoForge'],'serverPackFileId':303}}),patch.object(browser.os,'cpu_count',return_value=8):
    return browser.server_plan(**cfg)
  def test_preview_contains_settings_and_never_enables_creation(self):

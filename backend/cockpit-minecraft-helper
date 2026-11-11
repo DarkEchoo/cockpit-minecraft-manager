@@ -118,7 +118,7 @@ def relocate_server(server_id, requested):
         if state(service)!='inactive':raise ValueError('Stop the server before moving it')
         if state('minecraft-backup.service') in ('active','activating','deactivating'):
             raise ValueError('Backup in progress')
-        if registry()[server_id].get('type')=='spigot' and registry()[server_id].get('build')=='building':
+        if registry()[server_id].get('type') in ('spigot','paper','purpur') and registry()[server_id].get('build')=='building':
             raise ValueError('Wait for Spigot BuildTools to finish')
         unit_path=pathlib.Path('/etc/systemd/system')/service
         original=unit_path.read_text()
@@ -217,7 +217,7 @@ def public_json(url, hostname):
     """Read bounded JSON from a fixed vendor hostname, with no cross-host redirects."""
     from urllib.parse import urlparse
     if urlparse(url).scheme!='https' or urlparse(url).hostname!=hostname:raise ValueError('Unexpected metadata host')
-    req=urllib.request.Request(url,headers={'User-Agent':'JesseHomelabCockpit/2.0 (https://github.com/PaperMC/Paper)'})
+    req=urllib.request.Request(url,headers={'User-Agent':'CockpitMinecraftManager/2.0 (https://github.com/PaperMC/Paper)'})
     with urllib.request.urlopen(req,timeout=25) as response:
         if urlparse(response.url).hostname!=hostname:raise ValueError('Unexpected metadata redirect')
         raw=response.read(2_000_001)
@@ -251,7 +251,7 @@ def download_vendor_jar(url,target,sha256=None):
     from urllib.parse import urlparse
     permitted={'fill.papermc.io','api.purpurmc.org'}
     if urlparse(url).hostname not in permitted or urlparse(url).scheme!='https':raise ValueError('Unknown download host')
-    req=urllib.request.Request(url,headers={'User-Agent':'JesseHomelabCockpit/2.0 (https://github.com/PaperMC/Paper)'})
+    req=urllib.request.Request(url,headers={'User-Agent':'CockpitMinecraftManager/2.0 (https://github.com/PaperMC/Paper)'})
     with urllib.request.urlopen(req,timeout=90) as response:
         # Purpur may redirect to a file CDN. Permit only HTTPS, not HTTP.
         if urlparse(response.url).scheme!='https':raise ValueError('Unsafe download redirect')
@@ -726,7 +726,6 @@ def create_with_backup(name,version,port_s,server_type,directory,repository,rest
     except (ValueError,TypeError):raise ValueError('Invalid backup interval')
     if not 15<=interval<=10080:raise ValueError('Backup interval must be between 15 and 10080 minutes')
     repository=repository.strip() or REPO
-    if not repository:raise ValueError('Configure an existing Restic repository before creating a server')
     checked_directory(repository,True)
     if not pathlib.Path(KEY).is_file():raise ValueError('Restic password file missing')
     # Verify repository can actually be decrypted, even for manual-only schedules.
@@ -881,7 +880,7 @@ def file_catalog(server_id):
             if len(result)>=300:break
     for folder in sorted(UPLOAD_DIRS):
         if folder=='plugins' and server_id=='neoforge':continue
-        if folder=='plugins' and server_id!='neoforge' and registry()[server_id].get('type')!='spigot':continue
+        if folder=='plugins' and server_id!='neoforge' and registry()[server_id].get('type') not in ('spigot','paper','purpur'):continue
         if folder=='mods' and server_id!='neoforge':continue
         d=secure_path(root,folder)
         if d.is_dir():
@@ -1025,7 +1024,7 @@ def upload_file(server_id,category,filename):
         raise ValueError('Unsupported upload category')
     kind= 'neoforge' if server_id=='neoforge' else registry()[server_id].get('type')
     if category=='mods' and kind!='neoforge':raise ValueError('Mods upload is for NeoForge only')
-    if category=='plugins' and kind!='spigot':raise ValueError('Plugins upload is for Spigot only')
+    if category=='plugins' and kind not in ('spigot','paper','purpur'):raise ValueError('Plugins upload requires Spigot, Paper, or Purpur')
     if filename in ('.','..') or '/' in filename or '\\' in filename or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9._+() -]{0,155}',filename):
         raise ValueError('Invalid file name')
     ext=pathlib.Path(filename).suffix.lower()
@@ -1109,6 +1108,116 @@ def save_settings(server_id, settings):
     for k in settings:
         if k not in seen:out.append(k+'='+settings[k])
     return save_config(server_id,'server.properties','\n'.join(out)+'\n')
+
+# cockpit-moderation-audit-v0.3: append-only-by-interface privileged moderation history
+MODERATION_AUDIT=pathlib.Path('/var/lib/cockpit-minecraft-moderation/moderation-audit.jsonl')
+MODERATION_ACTIONS=frozenset(('ban','pardon','kick','whitelist-add','whitelist-remove'))
+
+def moderation_audit_append(entry):
+    folder=MODERATION_AUDIT.parent
+    folder.mkdir(parents=True,exist_ok=True,mode=0o700)
+    os.chmod(folder,0o700)
+    with MODERATION_AUDIT.open('a+',encoding='utf-8') as fh:
+        os.chmod(MODERATION_AUDIT,0o600)
+        fcntl.flock(fh.fileno(),fcntl.LOCK_EX)
+        fh.seek(0,os.SEEK_END)
+        if fh.tell()>5_000_000:
+            raise RuntimeError('Moderation audit file exceeds 5 MB; archive it before more actions')
+        fh.write(json.dumps(entry,ensure_ascii=True,separators=(',',':'))+'\n')
+        fh.flush()
+        os.fsync(fh.fileno())
+
+def moderation_action(server_id,operation,username):
+    # Validate before sending a Minecraft command or creating an audit event.
+    service_name(server_id)
+    if operation not in MODERATION_ACTIONS:raise ValueError('Unsupported moderation action')
+    if not re.fullmatch(r'[A-Za-z0-9_]{3,16}',username or ''):
+        raise ValueError('Enter a valid Minecraft Java username')
+    # Audit availability is a precondition, preventing untracked actions.
+    folder=MODERATION_AUDIT.parent
+    folder.mkdir(parents=True,exist_ok=True,mode=0o700)
+    os.chmod(folder,0o700)
+    with MODERATION_AUDIT.open('a',encoding='utf-8'):
+        os.chmod(MODERATION_AUDIT,0o600)
+    entry={'timestamp_utc':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),
+           'server':server_id,'action':operation,'player':username}
+    try:
+        response=player_action(server_id,operation,username)
+    except Exception as exc:
+        entry['status']='error'
+        entry['detail']=str(exc)[:250]
+        moderation_audit_append(entry)
+        raise
+    entry['status']='response-received' if str(response).strip() else 'unconfirmed-empty-response'
+    entry['detail']=str(response).strip()[:250]
+    moderation_audit_append(entry)
+    return {'status':entry['status'],'response':response,'audit':'recorded'}
+
+def moderation_history(server_id):
+    service_name(server_id)
+    if not MODERATION_AUDIT.exists():return []
+    # Only root-accessible audit data; bounded to 100 latest matching entries.
+    from collections import deque
+    items=deque(maxlen=100)
+    with MODERATION_AUDIT.open('r',encoding='utf-8') as fh:
+        for line in fh:
+            try:entry=json.loads(line)
+            except (ValueError,TypeError):continue
+            if entry.get('server')==server_id:items.append(entry)
+    return list(reversed(items))
+
+
+# cockpit-moderation-warning-v0.5 — records a staff warning, does not send chat.
+def moderation_record_warning(server_id, username, reason):
+    service_name(server_id)
+    if not re.fullmatch(r'[A-Za-z0-9_]{3,16}', username or ''):
+        raise ValueError('Enter an exact Minecraft Java username')
+    if not isinstance(reason,str) or not (3<=len(reason.strip())<=240):
+        raise ValueError('Warning reason must be 3–240 characters')
+    reason=reason.strip()
+    if any(ord(ch)<32 or ord(ch)==127 for ch in reason):
+        raise ValueError('Warning reason may not contain control characters')
+    entry={'timestamp_utc':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),
+           'server':server_id,'action':'warn','player':username,
+           'status':'recorded-not-delivered','detail':reason}
+    moderation_audit_append(entry)
+    return {'status':'recorded-not-delivered','audit':'recorded',
+            'message':'Warning recorded in Cockpit only; player was not notified in-game.'}
+
+# cockpit-moderation-search-v0.4 - read-only filtered player history.
+# Searches only actions explicitly recorded by this Cockpit audit; no inferred events.
+def moderation_search(server_id, query='', action='all'):
+    service_name(server_id)
+    if not isinstance(query,str) or len(query)>80:raise ValueError('Search is too long')
+    if action not in ('all','ban','pardon','kick','whitelist-add','whitelist-remove',
+                      'warn','mute','tempban','tempmute'):
+        raise ValueError('Unknown history filter')
+    if not MODERATION_AUDIT.exists():
+        return {'entries':[],'counts':{},'total':0,'matched':0,'truncated':False,
+                'scope':'cockpit-moderation-audit-only'}
+    from collections import deque,Counter
+    # The v0.3 audit caps file growth at 5MB. Bounded result payload, counts from
+    # the entire file, including records older than the last 100 results.
+    found=deque(maxlen=250)
+    counts=Counter()
+    total=matched=0
+    q=query.casefold().strip()
+    with MODERATION_AUDIT.open('r',encoding='utf-8') as fh:
+        for line in fh:
+            try:e=json.loads(line)
+            except (ValueError,TypeError):continue
+            if not isinstance(e,dict) or e.get('server')!=server_id:continue
+            total+=1
+            if q and q not in str(e.get('player','')).casefold():continue
+            counts[str(e.get('action','unknown'))]+=1
+            if action!='all' and action!=e.get('action'):continue
+            matched+=1
+            # Never send arbitrary nested data back to the dashboard.
+            found.append({k:str(e.get(k,''))[:500] for k in
+                          ('timestamp_utc','player','action','status','detail')})
+    return {'entries':list(reversed(found)),'counts':dict(counts),'total':total,
+            'matched':matched,'truncated':matched>len(found),
+            'scope':'cockpit-moderation-audit-only'}
 
 def player_action(server_id,operation,username=None):
     if operation=='list':return rcon_command(server_id,'list')
@@ -1218,7 +1327,7 @@ def server_insights(server_id):
 
 def addon_catalog(server_id):
     root=file_root(server_id)
-    folder='mods' if server_id=='neoforge' else ('plugins' if registry()[server_id].get('type')=='spigot' else None)
+    folder='mods' if server_id=='neoforge' else ('plugins' if registry()[server_id].get('type') in ('spigot','paper','purpur') else None)
     if not folder:return []
     d=secure_path(root,folder)
     if not d.is_dir():return []
@@ -1230,7 +1339,7 @@ def toggle_addon(server_id,filename,enable):
     ensure_stopped(server_id)
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+() -]{0,155}\.jar(?:\.disabled)?',filename):
         raise ValueError('Invalid add-on name')
-    folder='mods' if server_id=='neoforge' else ('plugins' if registry()[server_id].get('type')=='spigot' else None)
+    folder='mods' if server_id=='neoforge' else ('plugins' if registry()[server_id].get('type') in ('spigot','paper','purpur') else None)
     if not folder:raise ValueError('This server does not support mod/plugin JARs')
     src=secure_path(file_root(server_id),folder+'/'+filename)
     if not src.is_file() or src.is_symlink():raise ValueError('Add-on not found')
@@ -1240,6 +1349,158 @@ def toggle_addon(server_id,filename,enable):
     if dest.exists():raise ValueError('Destination already exists')
     src.rename(dest)
     return 'Enabled' if enable else 'Disabled'
+
+
+def addon_location(server_id):
+    if server_id == 'neoforge':
+        return 'mods'
+    if registry()[server_id].get('type') in ('spigot','paper','purpur'):
+        return 'plugins'
+    raise ValueError('This server does not support these add-ons')
+
+def addon_quarantine(server_id, create=False):
+    root = file_root(server_id)
+    target = root / '.cockpit-addon-quarantine'
+    if target.is_symlink():
+        raise ValueError('Unsafe quarantine directory')
+    if create:
+        target.mkdir(mode=0o700, exist_ok=True)
+    if target.exists() and not target.is_dir():
+        raise ValueError('Invalid quarantine directory')
+    return target
+
+def validate_addon_filename(filename):
+    if not re.fullmatch(
+        r'[A-Za-z0-9][A-Za-z0-9._+() -]{0,155}\\.jar(?:\\.disabled)?',
+        filename
+    ):
+        raise ValueError('Invalid add-on filename')
+
+def remove_addon(server_id, filename):
+    ensure_stopped(server_id)
+    validate_addon_filename(filename)
+    folder = addon_location(server_id)
+    root = file_root(server_id)
+    src = secure_path(root, folder + '/' + filename)
+    if not src.is_file() or src.is_symlink():
+        raise ValueError('Add-on not found')
+
+    quarantine = addon_quarantine(server_id, True)
+    dest = quarantine / filename
+    if dest.exists() or dest.is_symlink():
+        raise ValueError('Already quarantined: ' + filename)
+
+    ensure_stopped(server_id)
+    src.rename(dest)
+    return 'Removed to quarantine: ' + filename
+
+def removed_addons(server_id):
+    addon_location(server_id)
+    quarantine = addon_quarantine(server_id)
+    if not quarantine.is_dir():
+        return []
+    result = []
+    for p in sorted(quarantine.iterdir()):
+        if p.is_file() and not p.is_symlink():
+            try:
+                validate_addon_filename(p.name)
+            except ValueError:
+                continue
+            result.append({
+                'name': p.name,
+                'bytes': p.stat().st_size
+            })
+    return result[:300]
+
+def restore_addon(server_id, filename):
+    ensure_stopped(server_id)
+    validate_addon_filename(filename)
+    folder = addon_location(server_id)
+    root = file_root(server_id)
+    src = addon_quarantine(server_id) / filename
+    dest = secure_path(root, folder + '/' + filename)
+
+    if not src.is_file() or src.is_symlink():
+        raise ValueError('Quarantined add-on not found')
+    if dest.exists() or dest.is_symlink():
+        raise ValueError('A file with this name already exists')
+
+    ensure_stopped(server_id)
+    src.rename(dest)
+    return 'Restored: ' + filename
+
+
+# Files-tab safe add-on quarantine. Does not modify plugin configuration folders.
+def files_addon_folder(server_id):
+    if server_id == 'neoforge':
+        return 'mods'
+    if registry()[server_id].get('type') in ('spigot', 'paper', 'purpur'):
+        return 'plugins'
+    raise ValueError('This server does not support Bukkit-style plugins')
+
+def files_addon_filename(name):
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+() -]{0,155}[.]jar(?:[.]disabled)?', name):
+        raise ValueError('Invalid add-on filename')
+
+def files_addon_quarantine(server_id, create=False):
+    root = file_root(server_id)
+    target = secure_path(root, '.cockpit-addon-quarantine')
+    if target.is_symlink():
+        raise ValueError('Unsafe quarantine directory')
+    if create:
+        target.mkdir(mode=0o700, exist_ok=True)
+    if target.exists() and not target.is_dir():
+        raise ValueError('Invalid quarantine directory')
+    return target
+
+def files_removed_addons(server_id):
+    files_addon_folder(server_id)
+    q = files_addon_quarantine(server_id)
+    if not q.is_dir():
+        return []
+    out = []
+    for entry in sorted(q.iterdir()):
+        try:
+            files_addon_filename(entry.name)
+        except ValueError:
+            continue
+        if entry.is_file() and not entry.is_symlink():
+            out.append({'name': entry.name, 'bytes': entry.stat().st_size})
+    return out[:300]
+
+def files_move_addon(server_id, filename, restore=False):
+    ensure_stopped(server_id)
+    files_addon_filename(filename)
+    folder = files_addon_folder(server_id)
+    root = file_root(server_id)
+    installed = secure_path(root, folder + '/' + filename)
+    quarantine = files_addon_quarantine(server_id, create=not restore)
+    archived = quarantine / filename
+    source, destination = (archived, installed) if restore else (installed, archived)
+    if not source.is_file() or source.is_symlink():
+        raise ValueError('Plugin JAR not found')
+    if destination.exists() or destination.is_symlink():
+        raise ValueError('Destination already exists; refusing to overwrite')
+    ensure_stopped(server_id)
+    source.rename(destination)
+    return ('Restored: ' if restore else 'Quarantined: ') + filename
+
+def files_delete_quarantined_addon(server_id, filename, acknowledgement):
+    # Delete ONLY a previously quarantined plugin/mod JAR, never a live JAR.
+    ensure_stopped(server_id)
+    files_addon_folder(server_id)
+    files_addon_filename(filename)
+    if acknowledgement != 'DELETE ' + filename:
+        raise ValueError('Explicit permanent-delete confirmation missing')
+    quarantine = files_addon_quarantine(server_id)
+    if not quarantine.is_dir():
+        raise ValueError('No quarantined add-ons found')
+    target = secure_path(file_root(server_id), '.cockpit-addon-quarantine/' + filename)
+    if not target.is_file() or target.is_symlink():
+        raise ValueError('Quarantined JAR not found or unsafe')
+    ensure_stopped(server_id)
+    target.unlink()
+    return 'Permanently deleted quarantined JAR: ' + filename
 
 def snapshot_objects(server_id):
     service_name(server_id);repo=repo_for(server_id)
@@ -1534,6 +1795,480 @@ def schedule_bridge(action, server_id, payload=None):
         raise RuntimeError((result.stderr or result.stdout).strip()[:800])
     return json.loads(result.stdout)
 
+
+# cockpit-luckperms-readonly-v1
+
+def luckperms_snapshot(server_id):
+    service_name(server_id)
+    target=managed_path(server_id)/'plugins'/'CockpitLuckPermsBridge'/'snapshot.json'
+    if target.is_symlink() or not target.is_file():
+        raise RuntimeError('LuckPerms snapshot is not available. Start/restart Purpur and wait 5 seconds.')
+    if target.stat().st_size > 1024*1024:
+        raise RuntimeError('LuckPerms snapshot exceeds safety limit')
+    raw=json.loads(target.read_text(encoding='utf-8'))
+    if not isinstance(raw,dict) or raw.get('schema')!=1:
+        raise RuntimeError('Unsupported LuckPerms snapshot schema')
+    return raw
+
+# cockpit-admin-v0.6: scoped, audited rank and EssentialsX moderation commands
+ADMIN_RANKS=('owner','queen','admin','mod','player','default')
+ADMIN_TAB_CONFIG=pathlib.Path('/opt/minecraft/managed/tropics-purpur/plugins/TAB/config.yml')
+
+def admin_purpur(server_id):
+    service_name(server_id)
+    folder=managed_path(server_id)
+    if not folder.is_dir() or folder.is_symlink():raise ValueError('Server directory unavailable')
+    return folder
+
+def admin_server_rank_config(server_id):
+    folder=admin_purpur(server_id)
+    result={'server':server_id,'groups':[],'tab_order':[],'luckperms_available':False,'tab_available':False,
+            'essentials_available':(folder/'plugins'/'Essentials').is_dir(),'notes':[]}
+    try:
+        snap=luckperms_snapshot(server_id)
+        groups=snap.get('groups',[])
+        if not isinstance(groups,list):raise ValueError('Invalid groups list')
+        for item in groups:
+            if not isinstance(item,dict):continue
+            name=item.get('name') or item.get('id')
+            if not isinstance(name,str) or not re.fullmatch(r'[a-zA-Z0-9_-]{1,48}',name):continue
+            w=item.get('weight')
+            if isinstance(w,bool) or not isinstance(w,int):w=None
+            result['groups'].append({'name':name,'weight':w})
+        result['groups'].sort(key=lambda g:(-(g['weight'] if g['weight'] is not None else -1),g['name']))
+        result['luckperms_available']=bool(result['groups'])
+        if not result['luckperms_available']:result['notes'].append('LuckPerms bridge has no rank groups.')
+    except (ValueError,RuntimeError,OSError,json.JSONDecodeError) as exc:
+        result['notes'].append('LuckPerms unavailable: '+str(exc)[:200])
+    try:
+        result['tab_order']=admin_tab_status(server_id)['order']
+        result['tab_available']=True
+    except (ValueError,RuntimeError,OSError) as exc:
+        result['notes'].append('TAB unavailable: '+str(exc)[:200])
+    return result
+
+def admin_tab_path(server_id):
+    folder=admin_purpur(server_id)
+    path=folder/'plugins'/'TAB'/'config.yml'
+    if path.is_symlink() or not path.is_file():raise RuntimeError('TAB config.yml missing or symlinked for this server')
+    return path
+
+def admin_tab_status(server_id):
+    path=admin_tab_path(server_id)
+    if path.stat().st_size>500_000:raise RuntimeError('TAB config exceeds size limit')
+    text=path.read_text(encoding='utf-8')
+    matches=list(re.finditer(r'(?m)^(?P<indent>[ \t]*)-[ \t]*["\']?GROUPS:(?P<groups>[a-zA-Z0-9_,|]+)["\']?[ \t]*$',text))
+    if len(matches)!=1:raise RuntimeError('Expected exactly one simple GROUPS rule')
+    order=matches[0].group('groups').replace('|',',').split(',')
+    return {'order':order,'configured':True}
+
+def admin_tab_sort(server_id,order):
+    if not isinstance(order,str):raise ValueError('Invalid TAB rank order')
+    groups=[x.strip() for x in order.split(',')]
+    if not 1<=len(groups)<=30 or any(not re.fullmatch(r'[A-Za-z0-9_-]{1,48}',g) for g in groups) or len(groups)!=len(set(groups)):
+        raise ValueError('TAB order must list unique, valid rank names (max 30)')
+    current=admin_tab_status(server_id)['order']
+    if set(groups)!=set(current):raise ValueError('Use exactly the group names currently in this server TAB sorting rule')
+    path=admin_tab_path(server_id)
+    before=path.read_text(encoding='utf-8')
+    matches=list(re.finditer(r'(?m)^(?P<indent>[ \t]*)-[ \t]*["\']?GROUPS:(?P<groups>[a-zA-Z0-9_,|]+)["\']?[ \t]*$',before))
+    if len(matches)!=1:raise RuntimeError('TAB sorting rule changed; refusing edit')
+    match=matches[0]
+    after=before[:match.start()]+match.group('indent')+'- "GROUPS:'+','.join(groups)+'"'+before[match.end():]
+    if after==before:return {'status':'already-configured','order':groups}
+    stamp=__import__('datetime').datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+    backup=path.with_name('config.yml.cockpit-admin-'+stamp+'.bak')
+    shutil.copy2(path,backup)
+    st=path.stat();temp=path.with_name('config.yml.cockpit-'+stamp+'.tmp')
+    try:
+        temp.write_text(after,encoding='utf-8');os.chmod(temp,st.st_mode & 0o777);os.chown(temp,st.st_uid,st.st_gid)
+        os.replace(temp,path)
+    finally:temp.unlink(missing_ok=True)
+    try:reply=str(rcon_command(server_id,'tab reload'))[:250]
+    except Exception as exc:reply='Config saved; reload failed: '+str(exc)[:200]
+    moderation_audit_append({'timestamp_utc':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),
+        'server':server_id,'action':'tab-sort','player':'(server)','status':'config-saved','detail':','.join(groups)})
+    return {'status':'config-saved','order':groups,'backup':str(backup),'reload':reply}
+
+def admin_rank_change(server_id,action,subject,value):
+    admin_purpur(server_id)
+    snap=admin_server_rank_config(server_id)
+    if not snap['luckperms_available']:raise RuntimeError('LuckPerms rank snapshot unavailable for this server')
+    names={g['name'].lower():g['name'] for g in snap['groups']}
+    if action=='weight':
+        group=subject.lower()
+        if group not in names:raise ValueError('Rank does not exist on selected server')
+        if not isinstance(value,str) or not re.fullmatch(r'\d{1,4}',value):raise ValueError('Weight must be 0–9999')
+        command=f'lp group {names[group]} setweight {int(value)}';label=names[group]
+    elif action=='assign':
+        if not re.fullmatch(r'[A-Za-z0-9_]{3,16}',subject or ''):raise ValueError('Invalid Minecraft username')
+        group=value.lower()
+        if group not in names:raise ValueError('Rank does not exist on selected server')
+        command=f'lp user {subject} parent set {names[group]}';label=subject
+    else:raise ValueError('Unsupported rank operation')
+    try:response=str(rcon_command(server_id,command)).strip()[:250]
+    except Exception as exc:
+        moderation_audit_append({'timestamp_utc':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),
+            'server':server_id,'action':'rank-'+action,'player':label,'status':'error','detail':str(exc)[:240]});raise
+    moderation_audit_append({'timestamp_utc':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),
+        'server':server_id,'action':'rank-'+action,'player':label,
+        'status':'response-received' if response else 'unconfirmed-empty-response','detail':command+' | '+response})
+    return {'status':'response-received' if response else 'unconfirmed-empty-response','command':command,'response':response,
+            'notice':'RCON acknowledgement does not prove success; reload and independently verify the rank.'}
+
+def admin_essentials_action(server_id,operation,username,duration,reason):
+    folder=admin_purpur(server_id)
+    if not re.fullmatch(r'[A-Za-z0-9_]{3,16}',username or ''):raise ValueError('Invalid Minecraft username')
+    if operation not in ('tempban','tempmute','unmute','warn-message'):raise ValueError('Unsupported action')
+    if not isinstance(reason,str) or len(reason.strip())>120 or any(ord(c)<32 or ord(c)==127 for c in reason):
+        raise ValueError('Reason must be at most 120 printable characters')
+    reason=reason.strip()
+    if operation not in ('unmute',) and len(reason)<3:raise ValueError('Enter a reason of at least 3 characters')
+    if operation in ('tempban','tempmute'):
+        if not isinstance(duration,str) or not re.fullmatch(r'(?:[1-9][0-9]{0,2})(?:m|h|d)',duration):
+            raise ValueError('Use a duration such as 30m, 2h, or 1d (maximum 999 units)')
+        amount=int(duration[:-1]);unit=duration[-1]
+        if amount * {'m':1,'h':60,'d':1440}[unit]>43200:
+            raise ValueError('Maximum duration is 30 days')
+    if not (folder/'plugins'/'Essentials').is_dir():
+        raise RuntimeError('EssentialsX data folder not found; timed actions unavailable')
+    if operation=='tempban':cmd=f'essentials:tempban {username} {duration} {reason}'
+    elif operation=='tempmute':cmd=f'essentials:mute {username} {duration} {reason}'
+    elif operation=='unmute':cmd=f'essentials:unmute {username}'
+    else:
+        # Tellraw uses a JSON escaped string, keeping the command under the RCON limit.
+        message='[Staff Warning] '+reason
+        cmd='minecraft:tellraw '+username+' '+json.dumps({'text':message,'color':'red'},ensure_ascii=True,separators=(',',':'))
+    if len(cmd)>240:raise ValueError('Message too long for RCON')
+    entry={'timestamp_utc':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),
+           'server':server_id,'action':operation,'player':username,
+           'detail':(('duration '+duration+' | ') if operation in ('tempban','tempmute') else '')+reason}
+    try:response=str(rcon_command(server_id,cmd)).strip()[:240]
+    except Exception as exc:
+        entry.update(status='error',detail=str(exc)[:240])
+        moderation_audit_append(entry);raise
+    entry['status']='response-received' if response else 'unconfirmed-empty-response'
+    entry['detail']+=' | reply: '+response
+    moderation_audit_append(entry)
+    return {'status':entry['status'],'response':response,
+            'notice':'Recorded as command attempted, not as a confirmed punishment. EssentialsX handles timed expiration.'}
+
+# Cockpit admin v0.7 — bounded, read-only NovaAC event explorer
+
+def admin07_novaac_events(server_id):
+    service_name(server_id)  # Existing registry validation, not an arbitrary filesystem path
+    root=managed_path(server_id)/'plugins'/'NovaAC'
+    result={'server':server_id,'installed':False,'files':[],'events':[],'truncated':False,
+            'notice':'NovaAC log folder not present on this server.'}
+    if root.is_symlink() or not root.is_dir():return result
+    result['installed']=True
+    # Read only explicitly recognized NovaAC log files; no arbitrary user-supplied paths.
+    candidates=[]
+    for folder in (root,root/'logs',root/'violations',root/'history',root/'data'):
+        if folder.is_symlink() or not folder.is_dir():continue
+        for p in folder.iterdir():
+            if p.is_symlink() or not p.is_file() or p.suffix.lower() not in ('.log','.txt'):
+                continue
+            if not any(key in p.name.lower() for key in ('violat','alert','detect','punish')):
+                continue
+            st=p.stat()
+            if st.st_size>16*1024*1024:continue
+            candidates.append((st.st_mtime,p))
+    candidates.sort(key=lambda x:x[0],reverse=True)
+    if len(candidates)>12:result['truncated']=True
+    lines=[]
+    for _,p in candidates[:12]:
+        # Bound reads to the tail of each file, to avoid blocking Cockpit on large logs.
+        with p.open('rb') as f:
+            f.seek(0,2); size=f.tell(); f.seek(max(0,size-262144))
+            raw=f.read(262144)
+        decoded=raw.decode('utf-8','replace')
+        if size>262144:
+            result['truncated']=True
+            decoded=decoded.split('\n',1)[-1]
+        rel=str(p.relative_to(root))
+        result['files'].append(rel)
+        for line in decoded.splitlines()[-400:]:
+            line=line.strip()
+            if line:lines.append({'source':rel,'text':line[:600]})
+    # Most recently modified files first; events within a file retain their original order.
+    result['events']=lines[-1000:]
+    if len(lines)>1000:result['truncated']=True
+    result['notice']=('No matching NovaAC violation/alert text files were found.' if not candidates
+                     else 'Events are raw log entries, not verified infractions. No punishment actions are inferred.')
+    return result
+
+# Cockpit unified Admin Hub v1.0: server-scoped read-only reports
+
+def aio_plugin_report(server_id):
+    service_name(server_id)
+    items=addon_catalog(server_id)
+    selected=[]
+    warnings=[]
+    stems={}
+    installed_names=set()
+    # Treat individual filename metadata as indicative, never as a verified version match.
+    for item in items[:300]:
+        name=item['name']
+        stem=re.sub(r'[-_ ](?:v?\d[\w.+-]*)$', '', name.removesuffix('.disabled').removesuffix('.jar'),flags=re.I).casefold()
+        stems.setdefault(stem,[]).append(name)
+        plugin={'name':name,'enabled':item['enabled'],'bytes':item['bytes'],'plugin':None,'version':None,'declared_dependencies':[],'sha256':None}
+        if name.lower().endswith('.jar') and server_id!='neoforge':
+            jar=managed_path(server_id)/'plugins'/name
+            if jar.is_file() and not jar.is_symlink() and jar.stat().st_size<80_000_000:
+                try:
+                    plugin['sha256']=aio11_sha(jar)
+                    with zipfile.ZipFile(jar) as archive:
+                        for cfg in ('plugin.yml','paper-plugin.yml'):
+                            if cfg not in archive.namelist():continue
+                            if archive.getinfo(cfg).file_size>100_000:break
+                            raw=archive.read(cfg).decode('utf-8','replace')
+                            for key,field in (('name','plugin'),('version','version')):
+                                m=re.search(r'(?mi)^'+key+r':\s*["\']?([^\r\n"\']+)',raw)
+                                if m:plugin[field]=m.group(1).strip()[:100]
+                            # Dependencies in simple list form only (not all plugin YAML conventions).
+                            m=re.search(r'(?mi)^(?:depend|dependencies):\s*\[([^\]\r\n]{0,1000})\]',raw)
+                            if m:plugin['declared_dependencies']=[x.strip().strip('"\'')[:80] for x in m.group(1).split(',')][:20]
+                            break
+                except (OSError,zipfile.BadZipFile,RuntimeError,ValueError):
+                    warnings.append(name+': unreadable or unsupported plugin metadata')
+        if plugin['plugin']:installed_names.add(plugin['plugin'].casefold())
+        selected.append(plugin)
+    grouped_plugins={}
+    for item in selected:
+        if item['plugin'] and item['enabled']:
+            grouped_plugins.setdefault(item['plugin'].casefold(),[]).append(item['name'])
+    for pname,names in grouped_plugins.items():
+        if len(names)>1:warnings.append('Duplicate plugin ID '+pname+': '+', '.join(names[:6]))
+    for stem,names in stems.items():
+        if len(names)>1 and stem:
+            warnings.append('Possible duplicate plugin/mod family: '+', '.join(names[:6]))
+    for item in selected:
+        for dep in item['declared_dependencies']:
+            if dep.casefold() not in installed_names:
+                warnings.append(item['name']+': declared dependency not found by plugin name: '+dep)
+    return {'server':server_id,'items':selected,'warnings':warnings[:70],
+            'notice':'Filename and limited manifest inspection only; no online compatibility verification or automatic removal.'}
+
+
+def aio_player_profiles(server_id, query=''):
+    service_name(server_id)
+    if not isinstance(query,str) or len(query)>64:raise ValueError('Invalid player search')
+    q=query.casefold().strip()
+    root=managed_path(server_id)
+    cache=root/'usercache.json'
+    users=[]
+    if cache.is_file() and not cache.is_symlink() and cache.stat().st_size<4_000_000:
+        try:
+            data=json.loads(cache.read_text(encoding='utf-8'))
+            if isinstance(data,list):
+                for player in data[:10000]:
+                    if not isinstance(player,dict):continue
+                    username=str(player.get('name',''))
+                    player_uuid=str(player.get('uuid',''))
+                    if not re.fullmatch(r'[A-Za-z0-9_]{3,16}',username):continue
+                    if not re.fullmatch(r'[a-fA-F0-9-]{32,36}',player_uuid):continue
+                    if q and q not in username.casefold() and q not in player_uuid.casefold():continue
+                    users.append({'name':username,'uuid':player_uuid,'expires':str(player.get('expiresOn',''))[:50]})
+        except (OSError,ValueError,TypeError):pass
+    uuid_search=bool(re.fullmatch(r'[a-fA-F0-9-]{32,36}',query.strip()))
+    audit=(moderation_search(server_id,query,'all') if not uuid_search else
+           {'entries':[],'matched':0,'truncated':False})
+    entries=audit['entries']
+    # Audit records are username-based. Do not assert UUID identity for historical actions.
+    for user in users:
+        user['recorded_actions']=sum(1 for e in entries if e['player'].casefold()==user['name'].casefold())
+        user['identity_confidence']='usercache UUID; punishment history matched by username only (unverified)'
+    return {'server':server_id,'players':users[:150],'audit_entries':entries[:120],
+            'matched_audit':audit['matched'],'audit_truncated':audit['truncated'],
+            'notice':'Offline names/UUIDs come from the selected server usercache.json. Old audit records use usernames, so renamed-player history may be incomplete. No cross-server sharing.'}
+
+
+def aio_https_json(url,prefix):
+    if not url.startswith(prefix):raise ValueError('Unexpected vendor URL')
+    req=urllib.request.Request(url,headers={'User-Agent':'CockpitMinecraftAdmin/1.0 (https://github.com/DarkEchoo/cockpit-minecraft-manager)','Accept':'application/json'})
+    with urllib.request.urlopen(req,timeout=12) as resp:
+        if resp.status!=200:raise RuntimeError('Vendor returned HTTP '+str(resp.status))
+        payload=resp.read(600_000)
+    return json.loads(payload)
+
+
+def aio_update_check(server_id):
+    service_name(server_id)
+    data=info(server_id)
+    kind=(registry()[server_id].get('type') if server_id!='neoforge' else 'neoforge')
+    version=str(registry()[server_id].get('version','')) if server_id!='neoforge' else ''
+    result={'server':server_id,'type':kind,'installed_minecraft_version':version,'build':None,
+            'channel':None,'download_url':None,'status':'Unsupported server type for this update checker',
+            'manual_only':True,'notes':['No server JAR is downloaded or replaced by this report.']}
+    if kind not in ('purpur','paper'):
+        return result
+    if not re.fullmatch(r'[0-9][a-zA-Z0-9_.-]{0,29}',version):
+        raise ValueError('Cannot verify server version')
+    if kind=='purpur':
+        meta=aio_https_json('https://api.purpurmc.org/v2/purpur/'+version,
+                            'https://api.purpurmc.org/v2/purpur/')
+        build=meta.get('builds',{}).get('latest')
+        if not isinstance(build,int) and not (isinstance(build,str) and build.isdigit()):
+            result['status']='No build returned for this Minecraft version';return result
+        result.update(build=str(build),channel='vendor latest',
+                      download_url='https://api.purpurmc.org/v2/purpur/'+version+'/'+str(build)+'/download',
+                      status='Vendor build available; manual update requires a stopped server and verified full-world backup')
+    else:
+        url='https://fill.papermc.io/v3/projects/paper/versions/'+version+'/builds'
+        builds=aio_https_json(url,'https://fill.papermc.io/v3/projects/paper/')
+        if not isinstance(builds,list):raise ValueError('Unrecognized PaperMC downloads API response')
+        stable=next((b for b in builds if isinstance(b,dict) and b.get('channel')=='STABLE'),None)
+        if not stable:
+            result['status']='No STABLE Paper build found for this Minecraft version';return result
+        dl=stable.get('downloads',{}).get('server:default',{})
+        link=dl.get('url') if isinstance(dl,dict) else None
+        if isinstance(link,str) and link.startswith('https://'):
+            result['download_url']=link
+        result.update(build=str(stable.get('id','')),channel='STABLE',
+                      status='Stable vendor build available; manual update requires a stopped server and verified full-world backup')
+    return result
+
+
+# AIO v1.1: controlled same-Minecraft-version Paper/Purpur maintenance.
+# Deliberately no cross-version world upgrades, no unattended restart.
+
+def aio11_kind_version(server_id):
+    service_name(server_id)
+    if server_id == 'neoforge':raise ValueError('Only managed Paper/Purpur servers supported')
+    rec=registry().get(server_id,{})
+    kind=rec.get('type');version=rec.get('version')
+    if kind not in ('paper','purpur') or not isinstance(version,str) or not re.fullmatch(r'[0-9][A-Za-z0-9_.-]{0,29}',version):
+        raise ValueError('This server is not a supported Paper/Purpur instance')
+    return kind,version
+
+def aio11_jar_and_history(server_id):
+    root=file_root(server_id)
+    jar=root/'server.jar'
+    history=root/'.cockpit-jar-history'
+    if not jar.is_file() or jar.is_symlink() or history.is_symlink():
+        raise ValueError('Server JAR missing or unsafe path')
+    return jar,history
+
+def aio11_sha(path):
+    h=hashlib.sha256()
+    with path.open('rb') as stream:
+        for part in iter(lambda:stream.read(1024*1024),b''):h.update(part)
+    return h.hexdigest()
+
+def aio11_preflight(server_id):
+    kind,version=aio11_kind_version(server_id)
+    jar,hist=aio11_jar_and_history(server_id)
+    status=state(service_name(server_id))
+    free=shutil.disk_usage(jar.parent).free
+    problems=[]
+    if status!='inactive':problems.append('Stop the server before changing its JAR.')
+    if free<1024**3:problems.append('At least 1 GiB free on the server filesystem required.')
+    try:
+        repo=repo_for(server_id)
+        run(['restic','--repo',repo,'--password-file',KEY,'snapshots','--json'],timeout=90)
+    except Exception as exc:problems.append('Restic repository unavailable: '+str(exc)[:180])
+    if jar.stat().st_size>300*1024**2:problems.append('Unexpectedly large server.jar')
+    history=[]
+    if hist.is_dir():
+        for meta in sorted(hist.glob('*.json'),reverse=True)[:12]:
+            if meta.is_symlink() or meta.stat().st_size>10000:continue
+            try:
+                row=json.loads(meta.read_text())
+                if isinstance(row,dict) and re.fullmatch(r'[a-f0-9]{64}',str(row.get('sha256',''))):
+                    history.append({'id':meta.stem,'sha256':row['sha256'],'timestamp':row.get('timestamp',''),'build':row.get('build','')})
+            except (OSError,ValueError):pass
+    return {'server':server_id,'type':kind,'minecraft_version':version,'state':status,
+            'server_jar_sha256':aio11_sha(jar),'free_bytes':free,'ready':not problems,
+            'problems':problems,'history':history,
+            'note':'Updates only same Minecraft version; rollback only restores JAR, NOT worlds, plugin data, or configs.'}
+
+def aio11_snapshot_stopped(server_id):
+    repo=repo_for(server_id)
+    source=file_root(server_id)
+    # A successful restic backup must complete before any JAR is changed.
+    result=run(['restic','--repo',repo,'--password-file',KEY,
+                'backup',str(source),'--tag','cockpit-minecraft','--tag','mc-server-'+server_id,
+                '--tag','pre-jar-update'],timeout=1800)
+    return result[-1200:]
+
+def aio11_update(server_id,expected_sha):
+    if not re.fullmatch(r'[a-f0-9]{64}',str(expected_sha)):
+        raise ValueError('Invalid current JAR SHA256')
+    kind,version=aio11_kind_version(server_id)
+    lockfile=pathlib.Path('/run/lock/cockpit-minecraft-switch.lock')
+    with lockfile.open('a+') as lock:
+        fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+        ensure_stopped(server_id)
+        check=aio11_preflight(server_id)
+        if not check['ready']:raise ValueError('; '.join(check['problems']))
+        jar,history=aio11_jar_and_history(server_id)
+        if aio11_sha(jar)!=expected_sha:raise ValueError('Server JAR changed since preflight; reload first')
+        url,checksum=distribution_release(kind,version)
+        # Stage in the same filesystem. Never overwrite the live JAR on download failure.
+        import datetime
+        stamp=datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+        staged=jar.parent/('.cockpit-new-jar-'+stamp+'.tmp')
+        backupfile=None
+        try:
+            download_vendor_jar(url,staged,checksum)
+            staged_sha=aio11_sha(staged)
+            if staged_sha==expected_sha:
+                return {'status':'already-current','sha256':staged_sha,'message':'Vendor JAR is identical; no changes made.'}
+            # Backup after download, immediately before any file replacement.
+            snapshot=aio11_snapshot_stopped(server_id)
+            ensure_stopped(server_id)
+            if aio11_sha(jar)!=expected_sha:raise ValueError('JAR changed during backup; refusing replacement')
+            history.mkdir(mode=0o750,exist_ok=True)
+            if history.is_symlink():raise ValueError('Unsafe history path')
+            backupfile=history/(stamp+'-'+expected_sha+'.jar')
+            shutil.copy2(jar,backupfile)
+            if aio11_sha(backupfile)!=expected_sha:raise RuntimeError('JAR rollback copy checksum mismatch')
+            old=jar.stat()
+            os.chown(staged,old.st_uid,old.st_gid)
+            os.chmod(staged,old.st_mode & 0o777)
+            os.replace(staged,jar)
+            meta={'timestamp':stamp,'sha256':expected_sha,'new_sha256':staged_sha,
+                  'build':'previous server JAR','server':server_id,'minecraft_version':version}
+            mp=history/(backupfile.stem+'.json')
+            mp.write_text(json.dumps(meta,indent=2)+'\n')
+            os.chmod(mp,0o640)
+            return {'status':'updated','old_sha256':expected_sha,'new_sha256':staged_sha,
+                    'rollback_id':backupfile.stem,'restic_backup_output':snapshot,
+                    'message':'JAR replaced while stopped. World/plugins unchanged. Start and test server manually.'}
+        finally:
+            if staged.exists():staged.unlink()
+
+def aio11_rollback(server_id,rollback_id,expected_current_sha):
+    if not re.fullmatch(r'[0-9]{8}T[0-9]{12}Z-[a-f0-9]{64}',rollback_id):
+        raise ValueError('Invalid rollback ID')
+    if not re.fullmatch(r'[a-f0-9]{64}',str(expected_current_sha)):
+        raise ValueError('Invalid expected SHA')
+    aio11_kind_version(server_id)
+    with pathlib.Path('/run/lock/cockpit-minecraft-switch.lock').open('a+') as lock:
+        fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+        ensure_stopped(server_id)
+        jar,history=aio11_jar_and_history(server_id)
+        candidate=history/(rollback_id+'.jar')
+        if not candidate.is_file() or candidate.is_symlink():raise ValueError('Rollback JAR unavailable')
+        target_sha=rollback_id.rsplit('-',1)[1]
+        if aio11_sha(candidate)!=target_sha or aio11_sha(jar)!=expected_current_sha:
+            raise ValueError('JAR hash mismatch; recheck current server and rollback record')
+        if shutil.disk_usage(jar.parent).free<1024**3:raise RuntimeError('Insufficient free space')
+        snapshot=aio11_snapshot_stopped(server_id)
+        import datetime
+        stamp=datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+        staged=jar.parent/('.cockpit-rollback-'+stamp+'.tmp')
+        try:
+            shutil.copy2(candidate,staged)
+            current=jar.stat();os.chown(staged,current.st_uid,current.st_gid);os.chmod(staged,current.st_mode & 0o777)
+            if aio11_sha(staged)!=target_sha:raise ValueError('Restored JAR checksum mismatch')
+            os.replace(staged,jar)
+        finally:
+            if staged.exists():staged.unlink()
+        return {'status':'rolled-back','sha256':target_sha,'restic_backup_output':snapshot,
+                'message':'Only server.jar restored. World/plugin data NOT rolled back. Server remains stopped.'}
+
 def main(args):
     if not args:raise ValueError('Missing operation')
     op,*a=args
@@ -1564,6 +2299,22 @@ def main(args):
     if op=='schedule-history' and len(a)==1:
         return schedule_bridge('history',a[0])
 
+    if op=='aio11-preflight' and len(a)==1:return aio11_preflight(a[0])
+    if op=='aio11-update' and len(a)==2:return aio11_update(*a)
+    if op=='aio11-rollback' and len(a)==3:return aio11_rollback(*a)
+    if op=='aio-plugin-report' and len(a)==1:return aio_plugin_report(a[0])
+    if op=='aio-player-profiles' and len(a)==2:return aio_player_profiles(*a)
+    if op=='aio-update-check' and len(a)==1:return aio_update_check(a[0])
+    if op=='admin07-novaac-events' and len(a)==1:return admin07_novaac_events(a[0])
+    if op=='admin-rank-config' and len(a)==1:return admin_server_rank_config(a[0])
+    if op=='admin-tab-status' and len(a)==1:return admin_tab_status(a[0])
+    if op=='admin-tab-sort' and len(a)==2:return admin_tab_sort(*a)
+    if op=='admin-rank-change' and len(a)==4:return admin_rank_change(*a)
+    if op=='admin-essentials-action' and len(a)==5:return admin_essentials_action(*a)
+    if op=='moderation-action' and len(a)==3:return moderation_action(*a)
+    if op=='moderation-history' and len(a)==1:return moderation_history(a[0])
+    if op=='moderation-search' and len(a)==3:return moderation_search(*a)
+    if op=='moderation-record-warning' and len(a)==3:return moderation_record_warning(*a)
     if op=='players' and len(a) in (2,3):return player_action(a[0],a[1],a[2] if len(a)==3 else None)
     if op=='stats' and len(a)==1:return stats_server(a[0])
     if op=='insights' and len(a)==1:return server_insights(a[0])
@@ -1573,6 +2324,13 @@ def main(args):
     if op=='resource-policy' and len(a)==1:return resource_policy(a[0])
     if op=='cpu-quota' and len(a)==2:return apply_cpu_quota(a[0],a[1])
     if op=='addons' and len(a)==1:return addon_catalog(a[0])
+    if op=='files-addon-removed' and len(a)==1:return files_removed_addons(a[0])
+    if op=='files-addon-remove' and len(a)==2:return files_move_addon(a[0],a[1])
+    if op=='files-addon-restore' and len(a)==2:return files_move_addon(a[0],a[1],True)
+    if op=='files-addon-delete' and len(a)==3:return files_delete_quarantined_addon(a[0],a[1],a[2])
+    if op=='addon-remove' and len(a)==2:return remove_addon(a[0],a[1])
+    if op=='addon-removed' and len(a)==1:return removed_addons(a[0])
+    if op=='addon-restore' and len(a)==2:return restore_addon(a[0],a[1])
     if op=='addon-toggle' and len(a)==3:return toggle_addon(a[0],a[1],a[2]=='enable')
     if op=='snapshots-json' and len(a)==1:return snapshot_objects(a[0])
     if op=='restore' and len(a)==3:return restore_snapshot(a[0],a[1],a[2])
@@ -1603,6 +2361,7 @@ def main(args):
             return {'state':state(unit),'stopped':result['stopped']}
         run(['systemctl','stop',unit],timeout=180)
         return {'state':state(unit)}
+    if op=='luckperms-snapshot' and len(a)==1:return luckperms_snapshot(a[0])
     if op=='command' and len(a)==2:return rcon_command(a[0],a[1])
     if op=='enable-rcon' and len(a)==1:return enable_rcon(a[0])
     if op=='switch' and len(a)==1:return switch_server(a[0])

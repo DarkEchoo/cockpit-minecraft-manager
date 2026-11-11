@@ -6,5 +6,6 @@
       "path": "index.html",
       "order": 55
     }
-  }
+  },
+  "content-security-policy": "img-src 'self' https://media.forgecdn.net https://mediafilez.forgecdn.net https://edge.forgecdn.net https://media.curseforge.com https://static-cdn.jtvnw.net;"
 }

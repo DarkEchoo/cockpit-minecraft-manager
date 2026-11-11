@@ -5,8 +5,8 @@ CFG=pathlib.Path('/etc/minecraft-join-announcer.json')
 EXEC=pathlib.Path('/usr/local/libexec/minecraft-join-announcer')
 UNIT='minecraft-join-announcer.service'
 COLORS={'white','gold','yellow','green','aqua','blue','light_purple','red','gray','dark_red','dark_green','dark_aqua'}
-DEFAULT_UNIT=os.environ.get('COCKPIT_MC_JOIN_UNIT', '')
-PROPS=os.environ.get('COCKPIT_MC_JOIN_PROPERTIES', '')
+DEFAULT_UNIT='mc-managed-vanilla-test.service'
+PROPS='/opt/minecraft/managed/vanilla-test/server.properties'
 
 def run(*cmd):
     p=subprocess.run(cmd, text=True, capture_output=True, timeout=12)
@@ -14,7 +14,6 @@ def run(*cmd):
     return p.stdout.strip()
 
 def load():
-    if not DEFAULT_UNIT or not PROPS:raise ValueError('Join-control target is not configured')
     cfg=json.loads(CFG.read_text())
     if cfg.get('unit')!=DEFAULT_UNIT or cfg.get('properties')!=PROPS: raise ValueError('Unexpected announcer server configuration; refusing changes')
     return cfg

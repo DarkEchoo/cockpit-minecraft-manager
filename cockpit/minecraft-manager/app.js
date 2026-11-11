@@ -59,8 +59,89 @@ $('switch').onclick=()=>{const s=servers.find(x=>x.id===selection());if(!s)retur
  const others=servers.filter(x=>x.id!==s.id&&x.state==='active').map(x=>x.label);
  if(!confirm(`Switch to ${s.label}?\n\nThis will STOP: ${others.length?others.join(', '):'no other active servers'}.\nThen start the selected server. Connected players will be disconnected.`))return;
  action('Switch server',async()=>{await api('switch',s.id);await refresh();});};
+
+// cockpit-rcon-results-v1
+function ensureRconResultsPanel() {
+  let panel = document.getElementById('rcon-results-panel');
+  if (panel) return panel;
+
+  const command = $('command');
+  const container = command.closest('.sub-panel, .panel')
+    || command.parentElement.parentElement;
+
+  panel = document.createElement('section');
+  panel.id = 'rcon-results-panel';
+  panel.className = 'sub-panel';
+  panel.style.marginTop = '12px';
+
+  const heading = document.createElement('div');
+  heading.style.display = 'flex';
+  heading.style.justifyContent = 'space-between';
+  heading.style.alignItems = 'center';
+
+  const title = document.createElement('h3');
+  title.textContent = 'Command Results';
+
+  const clear = document.createElement('button');
+  clear.type = 'button';
+  clear.className = 'btn secondary';
+  clear.textContent = 'Clear results';
+
+  const output = document.createElement('pre');
+  output.id = 'rcon-results-output';
+  output.style.whiteSpace = 'pre-wrap';
+  output.style.overflowWrap = 'anywhere';
+  output.style.maxHeight = '320px';
+  output.style.overflowY = 'auto';
+  output.style.padding = '12px';
+  output.style.borderRadius = '8px';
+  output.style.background = 'rgba(0,0,0,0.22)';
+  output.textContent = 'Command responses will appear here.';
+
+  clear.onclick = () => {
+    output.textContent = '';
+  };
+
+  heading.append(title, clear);
+  panel.append(heading, output);
+  command.closest('.command-row').insertAdjacentElement('afterend', panel);
+
+  return panel;
+}
+
+let rconResultsServer = null;
+
+function appendRconResult(cmd, response) {
+  ensureRconResultsPanel();
+
+  const output = document.getElementById('rcon-results-output');
+  const server = selection();
+
+  if (rconResultsServer !== server) {
+    output.textContent = '';
+    rconResultsServer = server;
+  }
+
+  const text = String(response ?? '').replace(/§[0-9a-fk-or]/gi, '').trim();
+  const timestamp = new Date().toLocaleTimeString();
+
+  output.textContent +=
+    `[${timestamp}] ${server} > ${cmd}\n` +
+    `${text || '(No immediate RCON response)'}\n\n`;
+
+  output.scrollTop = output.scrollHeight;
+}
+
+ensureRconResultsPanel();
+
+$('server').addEventListener('change', () => {
+  const output = document.getElementById('rcon-results-output');
+  if (output) output.textContent = '';
+  rconResultsServer = selection();
+});
+
 $('send').onclick=()=>{let cmd=$('command').value.trim();if(!cmd)return;
- action('RCON command',async()=>{const r=await api('command',selection(),cmd);$('logs').textContent+=`\n> ${cmd}\n${r}\n`;$('command').value='';});};
+ action('RCON command',async()=>{const r=await api('command',selection(),cmd);appendRconResult(cmd, r);$('command').value='';});};
 $('command').addEventListener('keydown',e=>{if(e.key==='Enter')$('send').click();});
 $('backup').onclick=()=>{const s=servers.find(x=>x.id===selection());if(!s)return;
  if(!confirm(`Back up ${s.label} to your encrypted Restic repository?\n\nIf it is running, this temporarily stops and restarts that server. Connected players will be disconnected.`))return;
@@ -178,8 +259,11 @@ async function loadFiles(){
 function updateUpload(){
  let id=selection(),s=servers.find(x=>x.id===id);
  let kind=$('upload-kind').value;
- let type=id==='neoforge'?'neoforge':s?.label?.toLowerCase().startsWith('spigot')?'spigot':'vanilla';
- let incompatible=(kind==='mods'&&type!=='neoforge')||(kind==='plugins'&&type!=='spigot');
+ let label=(s?.label || '').toLowerCase();
+ let type=id==='neoforge'?'neoforge':
+   ['purpur','paper','spigot'].find(t=>label.includes(t)) || 'vanilla';
+ let incompatible=(kind==='mods'&&type!=='neoforge')||
+   (kind==='plugins'&&!['purpur','paper','spigot'].includes(type));
  $('upload-button').disabled=incompatible||s?.state!=='inactive'&&s?.state!=='failed';
  $('upload-status').textContent=incompatible?`The ${kind} folder is not supported for this server type.`:(s?.state==='active'?'Stop this server before uploading files.':'');
 }
@@ -201,17 +285,397 @@ $('file-save').onclick=()=>{
    await loadFiles();message(result);
  });
 };
+
+
+
+// cockpit-upload-queue-v2
+let pendingUploadFiles=[];
+
+function formatUploadBytes(bytes){
+  if(bytes >= 1024*1024) return (bytes/1024/1024).toFixed(2)+' MiB';
+  if(bytes >= 1024) return (bytes/1024).toFixed(1)+' KiB';
+  return bytes+' B';
+}
+
+function ensureUploadQueueUi(){
+  const input = $('upload-file');
+  if(!input) return null;
+
+  let queue = document.getElementById('upload-queue-panel');
+  if(queue) return queue;
+
+  queue = document.createElement('div');
+  queue.id = 'upload-queue-panel';
+  queue.style.marginTop = '10px';
+  queue.style.padding = '10px';
+  queue.style.border = '1px solid rgba(255,255,255,0.12)';
+  queue.style.borderRadius = '8px';
+  queue.style.background = 'rgba(255,255,255,0.02)';
+
+  input.parentElement.insertAdjacentElement('afterend', queue);
+  return queue;
+}
+
+function renderUploadQueue(){
+  const queue = ensureUploadQueueUi();
+  if(!queue) return;
+
+  queue.replaceChildren();
+
+  const title = document.createElement('div');
+  title.style.display = 'flex';
+  title.style.justifyContent = 'space-between';
+  title.style.alignItems = 'center';
+  title.style.marginBottom = '8px';
+
+  const left = document.createElement('strong');
+  left.textContent = pendingUploadFiles.length
+    ? `Selected files (${pendingUploadFiles.length})`
+    : 'Selected files';
+
+  title.append(left);
+
+  if(pendingUploadFiles.length){
+    const clear = document.createElement('button');
+    clear.type = 'button';
+    clear.className = 'btn secondary';
+    clear.textContent = 'Clear all';
+    clear.onclick = () => {
+      pendingUploadFiles = [];
+      $('upload-file').value = '';
+      renderUploadQueue();
+    };
+    title.append(clear);
+  }
+
+  queue.append(title);
+
+  if(!pendingUploadFiles.length){
+    const empty = document.createElement('div');
+    empty.className = 'small';
+    empty.textContent = 'No files selected yet.';
+    queue.append(empty);
+    return;
+  }
+
+  pendingUploadFiles.forEach((file,index)=>{
+    const row = document.createElement('div');
+    row.className = 'addon-row';
+    row.style.display = 'flex';
+    row.style.justifyContent = 'space-between';
+    row.style.alignItems = 'center';
+    row.style.gap = '12px';
+    row.style.padding = '6px 0';
+
+    const nameWrap = document.createElement('div');
+    nameWrap.style.display = 'flex';
+    nameWrap.style.flexDirection = 'column';
+    nameWrap.style.minWidth = '0';
+    nameWrap.style.flex = '1';
+
+    const name = document.createElement('span');
+    name.textContent = file.name;
+    name.style.wordBreak = 'break-word';
+
+    const meta = document.createElement('span');
+    meta.className = 'small';
+    meta.textContent = formatUploadBytes(file.size);
+
+    nameWrap.append(name, meta);
+
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'btn secondary';
+    remove.textContent = '×';
+    remove.title = 'Remove from upload queue';
+    remove.setAttribute('aria-label', 'Remove ' + file.name);
+    remove.style.minWidth = '36px';
+    remove.style.padding = '0.25rem 0.65rem';
+    remove.style.fontSize = '1rem';
+    remove.onclick = () => {
+      pendingUploadFiles.splice(index,1);
+      renderUploadQueue();
+    };
+
+    row.append(nameWrap, remove);
+    queue.append(row);
+  });
+}
+
+(function setupInlineUploadQueue(){
+  const input = $('upload-file');
+  if(!input) return;
+
+  ensureUploadQueueUi();
+  renderUploadQueue();
+
+  if(input.dataset.queueBound === '1') return;
+  input.dataset.queueBound = '1';
+
+  input.addEventListener('change',()=>{
+    const added = Array.from(input.files || []);
+    if(!added.length){
+      renderUploadQueue();
+      return;
+    }
+
+    // Avoid exact duplicate names already queued
+    for(const file of added){
+      if(!pendingUploadFiles.some(f => f.name === file.name && f.size === file.size)){
+        pendingUploadFiles.push(file);
+      }
+    }
+
+    input.value = '';
+    renderUploadQueue();
+  });
+
+  $('server').addEventListener('change',()=>{
+    pendingUploadFiles = [];
+    input.value = '';
+    renderUploadQueue();
+  });
+
+  $('upload-kind').addEventListener('change',()=>{
+    renderUploadQueue();
+  });
+})();
+
+
+// cockpit-files-installed-addons-v1
+(function initializeFilesPluginManager(){
+  const uploadButton=$('upload-button');
+  const host=uploadButton && uploadButton.closest('.sub-panel');
+  if(!host || document.getElementById('files-installed-addons'))return;
+  const panel=document.createElement('div');
+  panel.id='files-installed-addons';
+  panel.className='sub-panel';
+  panel.style.marginTop='16px';
+  const header=document.createElement('div');
+  header.style.display='flex';
+  header.style.alignItems='center';
+  header.style.justifyContent='space-between';
+  header.style.gap='12px';
+  const title=document.createElement('h3');
+  title.textContent='Installed plugins and mods';
+  const refresh=document.createElement('button');
+  refresh.type='button';
+  refresh.className='btn secondary';
+  refresh.textContent='Refresh installed';
+  const content=document.createElement('div');
+  content.setAttribute('role','status');
+  content.style.marginTop='12px';
+  header.append(title,refresh);
+  panel.append(header,content);
+  host.insertAdjacentElement('afterend',panel);
+  let requestSerial=0;
+  let loading=false;
+
+  async function loadFilesAddons(){
+    if(loading)return;
+    loading=true;
+    const request=++requestSerial;
+    const id=selection();
+    content.textContent='Loading installed plugins...';
+    try{
+      const [installed,removed]=await Promise.all([
+        api('addons',id),api('files-addon-removed',id)
+      ]);
+      if(request!==requestSerial || id!==selection())return;
+      content.replaceChildren();
+      const server=servers.find(s=>s.id===id);
+      const stopped=server && ['inactive','failed'].includes(server.state) && !busy;
+      const note=document.createElement('p');
+      note.className='small';
+      note.textContent='Stop this server before removing or restoring JARs. Configuration folders are preserved.';
+      content.append(note);
+
+      function section(label,items,operation,buttonLabel){
+        const heading=document.createElement('h4');
+        heading.textContent=label+' ('+items.length+')';
+        content.append(heading);
+        if(!items.length){
+          const empty=document.createElement('p');
+          empty.className='small';
+          empty.textContent='None';
+          content.append(empty);
+        }
+        for(const item of items){
+          const row=document.createElement('div');
+          row.className='addon-row';
+          row.style.display='flex';
+          row.style.alignItems='center';
+          row.style.justifyContent='space-between';
+          row.style.gap='10px';
+          row.style.padding='6px 0';
+          const name=document.createElement('span');
+          name.style.overflowWrap='anywhere';
+          name.textContent=item.name+' ('+(item.bytes/1048576).toFixed(2)+' MiB)';
+          const btn=document.createElement('button');
+          btn.type='button';
+          btn.className='btn secondary files-addon-action';
+          btn.textContent=buttonLabel;
+          btn.disabled=!stopped;
+          btn.onclick=()=>{
+            if(!confirm(buttonLabel+' '+item.name+' on '+id+'?\nServer must be stopped. The JAR is moved, not deleted.'))return;
+            action(buttonLabel+' add-on',async()=>{
+              const result=await api(operation,id,item.name);
+              message(result);
+              await loadFilesAddons();
+            });
+          };
+          row.append(name,btn);
+          if(operation==='files-addon-restore'){
+            const erase=document.createElement('button');
+            erase.type='button';
+            erase.className='btn secondary files-addon-action';
+            erase.textContent='Permanently Delete';
+            erase.title='Delete this quarantined JAR forever';
+            erase.disabled=!stopped;
+            erase.onclick=()=>{
+              const expected='DELETE '+item.name;
+              const response=prompt(
+                'Permanently delete '+item.name+' from quarantine?\n'+
+                'This cannot be undone. Plugin settings are NOT deleted.\n'+
+                'Type exactly: '+expected
+              );
+              if(response!==expected){
+                if(response!==null)message('Permanent deletion cancelled: confirmation did not match.',true);
+                return;
+              }
+              action('Permanently delete add-on',async()=>{
+                const result=await api('files-addon-delete',id,item.name,response);
+                message(result);
+                await loadFilesAddons();
+              });
+            };
+            row.append(erase);
+            row.style.flexWrap='wrap';
+          }
+          content.append(row);
+        }
+      }
+      section('Installed',installed,'files-addon-remove','Remove');
+      section('Removed — available to restore',removed,'files-addon-restore','Restore');
+    }catch(error){
+      content.textContent='Unable to load installed plugins: '+(error.message||String(error));
+    }finally{
+      loading=false;
+    }
+  }
+  refresh.onclick=()=>loadFilesAddons();
+  $('server').addEventListener('change',()=>{
+    requestSerial++;
+    content.textContent='Select Refresh installed to list plugins for this server.';
+  });
+  content.textContent='Select Refresh installed to list plugins for this server.';
+})();
+
 $('upload-button').onclick=()=>{
- const file=$('upload-file').files[0],id=selection(),kind=$('upload-kind').value;
- if(!file){message('Select a file to upload.',true);return;}
- if(file.size>(kind==='icon'?2:300)*1024*1024){message('File too large.',true);return;}
- if(!confirm(`Upload ${file.name} (${file.size} bytes) to ${id}? The server must be stopped.`))return;
- action('Upload file',async()=>{
-   // Cockpit supports binary streaming to process stdin; no public upload endpoint.
-   const bytes=new Uint8Array(await file.arrayBuffer());
-   const result=await fileInput('file-upload',[id,kind,file.name],bytes,true);
-   $('upload-file').value='';await loadFiles();message(result);
- });
+  const input=$('upload-file');
+  const files=[...pendingUploadFiles];
+  const id=selection();
+  const kind=$('upload-kind').value;
+  const status=$('upload-status');
+  const server=servers.find(s=>s.id===id);
+
+  if(!files.length){
+    message('Select one or more files.',true);
+    return;
+  }
+
+  if(!server || !['inactive','failed'].includes(server.state)){
+    message('Stop the server before uploading.',true);
+    return;
+  }
+
+  if(kind==='icon' && files.length!==1){
+    message('Only one server icon can be uploaded.',true);
+    return;
+  }
+
+  const extensions={
+    mods:'.jar',
+    plugins:'.jar',
+    resourcepacks:'.zip',
+    icon:'.png'
+  };
+
+  const expected=extensions[kind];
+  if(!expected){
+    message('Invalid upload destination.',true);
+    return;
+  }
+
+  const max=(kind==='icon'?2:300)*1024*1024;
+  const invalid=files.find(f=>
+    !f.name.toLowerCase().endsWith(expected) ||
+    f.size>max || f.size===0
+  );
+
+  if(invalid){
+    message('Invalid file type or size: '+invalid.name,true);
+    return;
+  }
+
+  if(!confirm(
+    `Upload ${files.length} file(s) to ${id}?\n`+
+    'The server must remain stopped. Existing files will not be overwritten.'
+  ))return;
+
+  action('Upload files',async()=>{
+    const successes=[];
+    const failures=[];
+
+    for(let i=0;i<files.length;i++){
+      const file=files[i];
+
+      status.textContent=
+        `Uploading ${i+1}/${files.length}: ${file.name}`;
+
+      try{
+        const bytes=new Uint8Array(await file.arrayBuffer());
+        await fileInput(
+          'file-upload',
+          [id,kind,file.name],
+          bytes,
+          true
+        );
+        successes.push(file.name);
+      }catch(e){
+        failures.push({
+          name:file.name,
+          error:e.message||String(e)
+        });
+      }
+    }
+
+    pendingUploadFiles=[];
+    renderUploadQueue();
+    pendingUploadFiles=[];
+    renderUploadQueue();
+    input.value='';
+
+    try{
+      await loadFiles();
+    }catch(e){
+      failures.push({
+        name:'File list refresh',
+        error:e.message||String(e)
+      });
+    }
+
+    const summary=
+      `Bulk upload complete: ${successes.length} succeeded, `+
+      `${failures.length} failed.`;
+
+    const details=failures.map(f=>
+      `${f.name}: ${f.error}`
+    ).join('; ');
+
+    message(summary+(details?' '+details:''),failures.length>0);
+    status.textContent=summary+(details?' '+details:'');
+  });
 };
 
 // The browser guard is UX only. Every privileged write is separately checked
@@ -319,16 +783,116 @@ async function loadMetrics(showMessage=true) {
  if(showMessage)message('Metrics refreshed.');
 }
 $('stats-refresh').onclick=()=>action('Load performance metrics',()=>loadMetrics());
+
 async function loadAddons(){
- const data=await api('addons',selection()),container=$('addons-list');container.replaceChildren();
- if(!data.length){container.textContent='No supported JAR files found for this server.';return;}
- for(const item of data){const row=document.createElement('div');row.className='addon-row';
- const name=document.createElement('span');name.textContent=item.name+' · '+(item.bytes/1048576).toFixed(2)+' MiB';
- const b=document.createElement('button');b.className='btn secondary addon-toggle';b.textContent=item.enabled?'Disable':'Enable';
- b.onclick=()=>{if(!confirm(`${item.enabled?'Disable':'Enable'} ${item.name}? Server must be stopped.`))return;
- action('Update add-on',async()=>{await api('addon-toggle',selection(),item.name,item.enabled?'disable':'enable');await loadAddons();});};
- row.append(name,b);container.append(row);}
- updateEditingGuards();
+  const id=selection();
+  const container=$('addons-list');
+  const installed=await api('addons',id);
+  const removed=await api('addon-removed',id);
+
+  container.replaceChildren();
+
+  function heading(label){
+    const h=document.createElement('h3');
+    h.textContent=label;
+    container.append(h);
+  }
+
+  function addButton(row,label,operation,filename,extra){
+    const b=document.createElement('button');
+    b.className='btn secondary addon-toggle';
+    b.textContent=label;
+
+    b.onclick=()=>{
+      const messageText=
+        `${label} ${filename} on ${id}?\\n`+
+        'The server must be stopped.\\n'+extra;
+
+      if(!confirm(messageText))return;
+
+      action(label+' add-on',async()=>{
+        const result=await api(operation,id,filename);
+        await loadAddons();
+        message(result);
+      });
+    };
+    row.append(b);
+  }
+
+  heading('Installed add-ons');
+
+  if(!installed.length){
+    const empty=document.createElement('p');
+    empty.textContent='No installed add-on JARs found.';
+    container.append(empty);
+  }
+
+  for(const item of installed){
+    const row=document.createElement('div');
+    row.className='addon-row';
+
+    const name=document.createElement('span');
+    name.textContent=
+      item.name+' · '+(item.bytes/1048576).toFixed(2)+' MiB';
+
+    row.append(name);
+
+    const toggle=document.createElement('button');
+    toggle.className='btn secondary addon-toggle';
+    toggle.textContent=item.enabled?'Disable':'Enable';
+
+    toggle.onclick=()=>{
+      if(!confirm(
+        `${item.enabled?'Disable':'Enable'} ${item.name}? `+
+        'The server must be stopped.'
+      ))return;
+
+      action('Update add-on',async()=>{
+        await api(
+          'addon-toggle',id,item.name,
+          item.enabled?'disable':'enable'
+        );
+        await loadAddons();
+      });
+    };
+
+    row.append(toggle);
+
+    addButton(
+      row,'Remove','addon-remove',item.name,
+      'The JAR will be moved to quarantine. '+
+      'Plugin settings will be preserved.'
+    );
+
+    container.append(row);
+  }
+
+  heading('Removed add-ons');
+
+  if(!removed.length){
+    const empty=document.createElement('p');
+    empty.textContent='No quarantined add-ons.';
+    container.append(empty);
+  }
+
+  for(const item of removed){
+    const row=document.createElement('div');
+    row.className='addon-row';
+
+    const name=document.createElement('span');
+    name.textContent=
+      item.name+' · '+(item.bytes/1048576).toFixed(2)+' MiB';
+    row.append(name);
+
+    addButton(
+      row,'Restore','addon-restore',item.name,
+      'The JAR will return to its original folder.'
+    );
+
+    container.append(row);
+  }
+
+  updateEditingGuards();
 }
 $('addons-refresh').onclick=()=>action('Load add-ons',loadAddons);
 $('restore-refresh').onclick=()=>action('Load recovery snapshots',async()=>{
@@ -799,7 +1363,7 @@ function portDisplay(d){
   'Selected target: '+(t?t.label+' (port '+t.port+')':'None'),
   'Forwarder service: '+(d.proxy_active?'RUNNING':'stopped'),
   'Listener on 25565: '+(d.port_25565_listener?'present':'none'),
-  'Connect: use the configured server address or your VPN address (when routing is active)',
+  'Connect: your server LAN or Tailscale IP (when routing is active)',
   d.warning||''
  ].join('\n');
 }
@@ -1083,3 +1647,47 @@ function upgradeInspect(){const s=upgradeSelected();$('upgrade-current').textCon
 $('upgrade-inspect').onclick=upgradeInspect;
 $('upgrade-load').onclick=()=>action('Load official releases',async()=>{const versions=await api('versions');const el=$('upgrade-version');el.replaceChildren();for(const version of versions){const o=document.createElement('option');o.value=version;o.textContent=version;el.add(o);}upgradeInspect();});
 $('upgrade-run').onclick=()=>{const s=upgradeSelected(),version=$('upgrade-version').value;if(!s||!version)return message('Select a server and target version.',true);if(s.id==='neoforge'||!s.label.startsWith('Vanilla ')||s.state!=='inactive')return message('Only stopped managed Vanilla servers can be upgraded.',true);if(!confirm(`Upgrade ${s.id} to Vanilla ${version}?\n\nThe previous jar is preserved. Minecraft world data is NOT backed up. The server stays stopped. Please make a world backup before first launch of a new Minecraft version.`))return;action('Upgrade Vanilla server',async()=>{const result=await api('upgrade-vanilla',s.id,version);$('upgrade-result').textContent=JSON.stringify(result,null,2);await refresh();upgradeInspect();});};
+
+// cockpit-luckperms-readonly-v1
+async function luckpermsRefresh() {
+  const status = $('luckperms-status');
+  const groups = $('luckperms-groups');
+  const users = $('luckperms-users');
+  const serverId = selection();
+  groups.replaceChildren(); users.replaceChildren();
+  if (serverId !== 'tropics-purpur') {
+    status.textContent = 'Select the tropics-purpur server in Overview.';
+    return;
+  }
+  status.textContent = 'Loading LuckPerms API snapshot...';
+  try {
+    const result=await api('luckperms-snapshot',serverId);
+    if(selection()!==serverId)return;
+    const groupItems=Array.isArray(result.groups)?result.groups:[];
+    const userItems=Array.isArray(result.loaded_users)?result.loaded_users:[];
+    status.textContent='Snapshot: '+String(result.generated_at||'unknown')+' · '+groupItems.length+' groups · '+userItems.length+' loaded users';
+    function detail(container,title,lines) {
+      const card=document.createElement('div'); card.className='sub-panel';
+      const header=document.createElement('h4');header.textContent=title;
+      const body=document.createElement('pre');body.className='output';
+      body.style.whiteSpace='pre-wrap';
+      body.textContent=lines.join('\n');
+      card.append(header,body); container.append(card);
+    }
+    if(!groupItems.length) groups.textContent='No groups are currently loaded.';
+    for(const g of groupItems) detail(groups,String(g.name||'Unknown group'),[
+      'Weight: '+(g.weight??'unset'),
+      'Prefix: '+(g.prefix??'none'),
+      'Inherits: '+((g.parents||[]).join(', ')||'none'),
+      'Direct granted permissions: '+((g.permissions||[]).join(', ')||'none')
+    ]);
+    if(!userItems.length) users.textContent='No user accounts are currently loaded into LuckPerms.';
+    for(const u of userItems) detail(users,String(u.name||u.uuid||'Unknown player'),[
+      'Primary group: '+String(u.primary_group||'unknown'),
+      'Direct parent groups: '+((u.parents||[]).join(', ')||'none'),
+      'UUID: '+String(u.uuid||'unknown')
+    ]);
+  } catch (e) { status.textContent='LuckPerms dashboard unavailable: '+String(e.message||e); }
+}
+$('luckperms-refresh').addEventListener('click',luckpermsRefresh);
+document.querySelectorAll('[data-tab="luckperms"]').forEach(btn=>btn.addEventListener('click',luckpermsRefresh));
